@@ -1,61 +1,24 @@
 #!/usr/bin/env python3
-# shaded_deps_hierarchy.py - report libraries bundled (shaded) inside
-# dependency jars, under the jar that bundles them, with their own hierarchy.
-# Python version: needs only python3 (standard library only; tested with 3.10)
-# and Maven 3.9+.
+# shaded_deps_hierarchy.py - Mend SCA pre-build hook: reports the libraries a
+# Maven dependency bundles ("shades") inside its jar, each under the library
+# that bundles it. A shaded jar's published POM doesn't declare them, so the
+# hook finds them in the jar (other libraries' pom.properties, or the jar's own
+# pom.xml when it configures maven-shade-plugin) and declares each one through
+# a byte-identical copy of its published jar, classified by the library that
+# declares it; Mend matches the copies by SHA-1. The patched POMs and the
+# copies go into an overlay repo in front of the local repo (.mvn/maven.config).
+# pom.xml is never changed, and if Maven fails with the patches, everything is
+# rolled back. See README.md. Needs python3 (standard library only; tested
+# with 3.10) and Maven 3.9+.
 #
-# Maven builds the tree from each dependency's own POM, and a shaded jar's
-# published POM doesn't declare what it bundles. The hook finds bundled
-# libraries from two sources in each jar:
-#   1. other libraries' pom.properties (META-INF/maven/<g>/<a>/), and
-#   2. the jar's own original pom.xml, when it configures maven-shade-plugin:
-#      runtime dependencies it declares that the published POM dropped. This
-#      finds libraries whose metadata was stripped (e.g. FastDoubleParser
-#      inside jackson-core).
-#
-# Every bundled library is declared through a byte-identical copy of its
-# published jar, under a classifier that names the library declaring it:
-# "shaded-<artifactId>-<version>". The bundling jar declares what its own
-# original pom.xml declares, and each bundled library declares its own
-# dependencies, both only among the libraries in the jar; a library nobody
-# declares is declared by the bundling jar. Every copy has its own Maven key,
-# so the project's own versions can't replace a bundled one, and a library
-# with two parents is kept under both. Mend matches the copies by SHA-1.
-#
-# A copy without children is declared without transitive dependencies. A copy
-# with children gets a POM that declares them and drops its other runtime
-# dependencies (they aren't in the jar). Copies of one version share that
-# version's POM, so only the first copy with children (nearest the project)
-# uses the published version. Every other one, and every copy of a version the
-# project uses itself (patching that POM would change the project's own copy
-# too), is declared at a version of its own, "<version>-<its classifier>",
-# with the published POM plus its children. Its children's classifiers name
-# that version, e.g. "shaded-jackson-core-2.22.1-shaded-jackson-databind-2.22.1",
-# so every library is reported under every library that declares it, at any
-# depth.
-#
-# The patched POMs go into a per-scan overlay repo, and Maven is pointed at it
-# via .mvn/maven.config: overlay = local repo "head", the real local repo
-# (~/.m2, or wherever settings.xml puts it) = read-only "tail"
-# (maven.repo.local.tail, Maven 3.9+). pom.xml is never modified, and no
-# existing local repo file is changed. The hook re-resolves in rounds, checks
-# every declared copy resolved under its parent, and looks inside jars that
-# newly appeared, so shading inside shaded libraries is followed too. If Maven
-# fails with the patches, everything is rolled back and the scan runs as if
-# this hook weren't there.
-#
-# The scanner fingerprints jars only in the real local repo, so at the end
-# files Maven downloaded into the overlay (and the copies) are copied there;
-# existing files are never overwritten and patched POMs never copied.
-#
-# The scanner executes the hook directly, so the first line must stay
-# "#!/usr/bin/env python3" and the file must use Unix (LF) line endings.
+# The scanner executes this file directly: keep "#!/usr/bin/env python3" as
+# the first line, and Unix (LF) line endings.
 
 REPOS = ""                   # repos to run for, space-separated; "" (or "*") = every Maven repo
 MVN_LOG_LEVEL = ""           # Maven output: -X = debug, "" = normal, -q = errors only
 MAX_ROUNDS = 10              # bounds re-resolution (nested shading)
 
-import os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
+import collections, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
 
 NS = "http://maven.apache.org/POM/4.0.0"
@@ -64,6 +27,8 @@ ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 RELOCATED = re.compile(r"^((?:.*/)?(?:shaded|repackaged|relocated)/[^/]+)/")
 CLASSIFIER_PREFIX = "shaded-"
 DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.6.0"
+CONFIG = os.path.join(".mvn", "maven.config")
+TREE_LINE = re.compile(r"((?:[| ]  )*[+\\]- |)(\(?[^\s:]+(?::\S+){3})")  # (prefix, g:a:type:...)
 
 
 class Rollback(Exception):
@@ -84,12 +49,21 @@ def repo_path(repo, g, a, v, ext="pom", classifier=""):
 
 
 def classifier_for(owner):
-    """The classifier of the copies a library (g:a:v) declares."""
+    """The classifier of the copies a library (g:a:v) declares. Maven's conflict
+    key includes it, so no other version or copy of the library can drop them."""
     g, a, v = owner.split(":")
     return CLASSIFIER_PREFIX + a + "-" + v
 
 
-def is_runtime(get):
+def coords(s):
+    """(g, a, classifier, v) of Maven's g:a:type[:classifier]:version[:scope]."""
+    p = s.split(":")
+    return (p[0], p[1], p[3], p[4]) if len(p) >= 6 else (p[0], p[1], "", p[3])
+
+
+def is_runtime(dep, ns):
+    """A <dependency> passed on to consumers."""
+    get = lambda tag: dep.findtext(ns + tag, "").strip()
     return get("scope") in ("", "compile", "runtime") and get("optional") != "true"
 
 
@@ -137,11 +111,9 @@ class Pom:
         ns = ns_of(self.root)
         found = {}
         for d in self.root.findall("%sdependencies/%sdependency" % (ns, ns)):
-            get = lambda tag: d.findtext(ns + tag, "").strip()
-            if not is_runtime(get):
-                continue
-            ga = self.expand(get("groupId")) + ":" + self.expand(get("artifactId"))
-            found[ga] = self.expand(get("version")) or self.managed.get(ga, "")
+            if is_runtime(d, ns):
+                ga = self.expand(d.findtext(ns + "groupId")) + ":" + self.expand(d.findtext(ns + "artifactId"))
+                found[ga] = self.expand(d.findtext(ns + "version")) or self.managed.get(ga, "")
         return found
 
 
@@ -191,11 +163,8 @@ def analyze(jar, g, a, v, pom_path, repos):
             deps = Pom(z.read(embedded), lg, ver, repos).runtime_deps() if embedded in names else {}
             graph[ga] = [d for d in deps if "${" not in d]
         if not bundled:
-            counts = {}
-            for n in names:
-                m = RELOCATED.match(n) if n.endswith(".class") and not n.startswith("META-INF/") else None
-                if m:
-                    counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+            classes = [n for n in names if n.endswith(".class") and not n.startswith("META-INF/")]
+            counts = collections.Counter(m.group(1) for m in map(RELOCATED.match, classes) if m)
             if counts:
                 licenses = sorted(os.path.basename(n) for n in names
                                   if re.fullmatch(r"META-INF/[^/]+-LICENSE[^/]*", n))
@@ -332,8 +301,7 @@ def write_pom(state, work, overlay, owner, patch):
     removed = 0
     if patch["strip"] and deps is not None:
         for d in list(deps):
-            get = lambda tag: d.findtext(ns + tag, "").strip()
-            if d.tag == ns + "dependency" and is_runtime(get):
+            if d.tag == ns + "dependency" and is_runtime(d, ns):
                 deps.remove(d)
                 removed += 1
     own_version = owner != patch["real"]
@@ -400,46 +368,42 @@ def materialize(state, work, overlay):
 
 
 def resolved_artifacts(path):
-    """[{g, a, v, classifier, file}] from dependency:list -DoutputAbsoluteArtifactFilename."""
+    """[(g, a, classifier, v, file)] from dependency:list -DoutputAbsoluteArtifactFilename."""
     arts = []
     with open(path) as f:
         for line in f:
-            token = line.split(" -- ")[0].strip()
-            if ":/" not in token:
-                continue
-            coords, file = token.split(":/", 1)
-            parts = coords.split(":")  # g:a:type[:classifier]:version:scope
-            if len(parts) >= 5:
-                arts.append({"g": parts[0], "a": parts[1], "v": parts[-2],
-                             "classifier": parts[3] if len(parts) == 6 else "",
-                             "file": "/" + file.split()[0]})
+            gav, sep, file = line.split(" -- ")[0].strip().partition(":/")
+            if sep and gav.count(":") >= 4:  # g:a:type[:classifier]:version:scope
+                arts.append(coords(gav) + ("/" + file.split()[0],))
     return arts
 
 
+def tree_lines(path):
+    """The text dependency:tree in PATH: a root, or a node after "+- " or
+    "\\- ". dependency:list wrote its entries (indented) to the same file."""
+    with open(path, errors="replace") as f:
+        return [line for line in f.read().splitlines() if TREE_LINE.match(line)]
+
+
 def read_tree(path):
-    """({node id: (g, a, classifier, v)}, {child id: parent id}) from
-    dependency:tree -DoutputType=tgf, or None if there is no tree."""
-    if not os.path.exists(path):
-        return None
-    nodes, parent = {}, {}
-    with open(path) as f:
-        for line in f:
-            t = line.split()
-            if len(t) < 2:
-                continue
-            if ":" in t[1]:  # node: id g:a:type[:classifier]:version[:scope]
-                p = t[1].split(":")
-                nodes[t[0]] = (p[0], p[1], p[3], p[4]) if len(p) >= 6 else (p[0], p[1], "", p[3])
-            else:  # edge: parent-id child-id scope
-                parent[t[1]] = t[0]
-    return nodes, parent
+    """[(node, its parent node or None)] in tree order, each node (g, a,
+    classifier, v), from the tree in PATH. Nodes Maven omitted (in
+    parentheses, with -Dverbose) are left out: the agent doesn't send them."""
+    tree, stack = [], []
+    for line in tree_lines(path):
+        prefix, node = TREE_LINE.match(line).groups()
+        del stack[len(prefix) // 3:]
+        stack.append(None if node.startswith("(") else coords(node))
+        if None not in stack:
+            tree.append((stack[-1], stack[-2] if len(stack) > 1 else None))
+    return tree
 
 
 def local_repo(arts):
     """The local repository root, from where Maven put a resolved artifact."""
-    for x in arts:
-        layout = os.path.join(*x["g"].split("."), x["a"], x["v"])
-        folder = os.path.dirname(x["file"])
+    for g, a, _, v, file in arts:
+        layout = os.path.join(*g.split("."), a, v)
+        folder = os.path.dirname(file)
         if folder.endswith(os.sep + layout):
             return folder[:-len(layout) - 1]
     return ""
@@ -449,12 +413,7 @@ def verify(state, arts, tree, last):
     """Check that every declared copy resolved under the library that declares
     it, and that nothing outside the jars came in with them. Returns True if
     the POMs need rewriting."""
-    nodes, parent = tree
-    under = set()
-    for i, (g, a, cls, v) in nodes.items():
-        p = nodes.get(parent.get(i))
-        if p:
-            under.add((p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls))
+    under = {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in tree if p}
     problems = 0
     for owner, patch in state["patches"].items():
         for ga, child in patch["children"].items():
@@ -465,7 +424,7 @@ def verify(state, arts, tree, last):
                 state["warned"].add((owner, ga))
                 log("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
                     % (owner, ga, child["as"], classifier_for(owner)))
-    plain = {x["g"] + ":" + x["a"] for x in arts if not x["classifier"]}
+    plain = {g + ":" + a for g, a, cls, _, _ in arts if not cls}
     extras = sorted(plain - state["baseline"] - state["bundled_all"] - state["exclusions"])
     state["problems"] = problems + len(extras)
     if not extras:
@@ -479,46 +438,42 @@ def verify(state, arts, tree, last):
 
 
 def run_round(state, work, overlay, n, last):
-    """One round over the dependency:list output (and, from round 2 on, the TGF
-    tree) in WORK. Round 1 records the baseline and the local repo. Checks the
-    copies declared in earlier rounds, then looks inside every artifact not
-    seen before (each copy too, top-down, so the copy nearest the project
-    keeps the published version) and records the copies each one that bundles
-    other libraries declares. Returns True if another round is needed."""
+    """Check the copies planned so far against Maven's output in WORK, then look
+    inside every jar not seen before, copies too, top-down (so the copy nearest
+    the project keeps the published version), and plan the copies each bundling
+    jar declares. Returns True if another round is needed."""
     arts = resolved_artifacts(os.path.join(work, "resolved.txt"))
     if n == 1:
-        state["baseline"] = {x["g"] + ":" + x["a"] for x in arts if not x["classifier"]}
-        state["baseline_gav"] = {"%s:%s:%s" % (x["g"], x["a"], x["v"]) for x in arts if not x["classifier"]}
-        state["claimed"] = {gav: "" for gav in state["baseline_gav"]}  # the project uses these POMs
+        plain = [(g, a, v) for g, a, cls, v, _ in arts if not cls]
+        state["baseline"] = {g + ":" + a for g, a, _ in plain}
+        state["claimed"] = {"%s:%s:%s" % gav: "" for gav in plain}  # the project uses these POMs
         state["m2"] = local_repo(arts)
-    tree = read_tree(os.path.join(work, "tree.tgf"))
-    changed = verify(state, arts, tree, n == last) if tree and state["patches"] else False
-    if tree:
-        order = {node: i for i, node in enumerate(tree[0].values())}
-        arts.sort(key=lambda x: order.get((x["g"], x["a"], x["classifier"], x["v"]), len(order)))
+    tree = read_tree(os.path.join(work, "resolved.txt"))
+    changed = verify(state, arts, tree, n == last) if state["patches"] else False  # none in round 1
+    order = {node: i for i, (node, _) in enumerate(tree)}
+    arts.sort(key=lambda x: order.get(x[:4], len(order)))
 
     repos = [state["m2"], overlay]
-    for x in arts:
-        gav = "%s:%s:%s" % (x["g"], x["a"], x["v"])
-        if (gav, x["classifier"]) in state["processed"] or not x["file"].endswith(".jar") \
-                or not os.path.exists(x["file"]):
+    for g, a, cls, v, jar in arts:
+        gav = "%s:%s:%s" % (g, a, v)
+        if (gav, cls) in state["processed"] or not jar.endswith(".jar") or not os.path.exists(jar):
             continue
-        state["processed"].add((gav, x["classifier"]))
+        state["processed"].add((gav, cls))
         real = state["patches"].get(gav, {}).get("real", gav)  # a copy's published version
         if real not in state["analysis"]:  # copies are byte-identical: look inside once
             pom = original_pom(state, work, overlay, *real.split(":"))
-            state["analysis"][real] = analyze(x["file"], *real.split(":"), pom, repos) if pom else ({}, {}, [])
+            state["analysis"][real] = analyze(jar, *real.split(":"), pom, repos) if pom else ({}, {}, [])
         bundled, graph, own_deps = state["analysis"][real]
         if not bundled:
             continue
         if n == last:
-            log("WARNING: %s - nested deeper than MAX_ROUNDS; not reported" % os.path.basename(x["file"]))
+            log("WARNING: %s - nested deeper than MAX_ROUNDS; not reported" % os.path.basename(jar))
             continue
-        owner = node_owner(state, overlay, gav, x["classifier"])
+        owner = node_owner(state, overlay, gav, cls)
         if owner in state["planned"]:
             continue
         state["planned"].add(owner)
-        plan_bundle(state, owner, os.path.basename(x["file"]), bundled, graph, own_deps)
+        plan_bundle(state, owner, os.path.basename(jar), bundled, graph, own_deps)
         changed = True
     return changed
 
@@ -545,95 +500,89 @@ def promote(state, overlay):
 
 def mvn_run(*args, stdin=None):
     """Print the full command line, then run it; True if Maven succeeded."""
-    print("[shaded-hook] $ mvn -B %s %s" % (MVN_LOG_LEVEL, " ".join(args)), flush=True)
+    log("$ mvn -B %s %s" % (MVN_LOG_LEVEL, " ".join(args)))
     return subprocess.run(["mvn", "-B"] + MVN_LOG_LEVEL.split() + list(args), stdin=stdin).returncode == 0
 
 
 def resolve(work, n):
     """Every resolved artifact with its file path, across all modules; from
-    round 2 on also the tree, to check each copy sits under its parent."""
-    for name in ("resolved.txt", "tree.tgf"):
-        if os.path.exists(os.path.join(work, name)):
-            os.remove(os.path.join(work, name))
-    if not mvn_run(DEP_PLUGIN + ":list", "-DoutputAbsoluteArtifactFilename=true",
-                   "-DoutputFile=" + os.path.join(work, "resolved.txt"), "-DappendOutput=true"):
-        return False
-    return n == 1 or mvn_run(DEP_PLUGIN + ":tree", "-DoutputType=tgf",
-                             "-DoutputFile=" + os.path.join(work, "tree.tgf"), "-DappendOutput=true")
+    round 2 on also the tree as the scanner's agent gets it (-Dverbose, text),
+    to check each copy sits under its parent. One Maven run, since starting
+    Maven is most of its cost: both goals append to the same file."""
+    out = os.path.join(work, "resolved.txt")
+    if os.path.exists(out):
+        os.remove(out)
+    tree = [DEP_PLUGIN + ":tree", "-Dverbose", "-DoutputType=text", "-T1"] if n > 1 else []
+    return mvn_run(DEP_PLUGIN + ":list", *tree, "-DoutputAbsoluteArtifactFilename=true",
+                   "-DoutputFile=" + out, "-DappendOutput=true")
 
 
 def print_prefixed(path):
     with open(path, errors="replace") as f:
         for line in f.read().splitlines():
-            print("[shaded-hook]   " + line, flush=True)
+            log("  " + line)
 
 
-def add_overlay_config(work, overlay, m2):
-    """Append the overlay settings to .mvn/maven.config, keeping a copy of the
-    original to roll back to."""
+def add_overlay_config(state, overlay):
+    """Append the overlay settings to .mvn/maven.config, so the scanner's own
+    Maven runs see the patched POMs; state["config"] keeps the original."""
     os.makedirs(".mvn", exist_ok=True)
-    config = os.path.join(".mvn", "maven.config")
-    existing = b""
-    if os.path.exists(config):
-        shutil.copyfile(config, os.path.join(work, "maven.config.orig"))
-        with open(config, "rb") as f:
-            existing = f.read()
-    with open(config, "ab") as f:
+    state["config"] = None  # kept before appending, so a partial append is rolled back too
+    if os.path.exists(CONFIG):
+        with open(CONFIG, "rb") as f:
+            state["config"] = f.read()
+    with open(CONFIG, "ab") as f:
         # keep any existing config intact, even one without a trailing newline
-        if existing and not existing.endswith(b"\n"):
+        if state["config"] and not state["config"].endswith(b"\n"):
             f.write(b"\n")
-        f.write(("-Dmaven.repo.local=%s\n-Dmaven.repo.local.tail=%s\n" % (overlay, m2)).encode())
-    open(os.path.join(work, "config-written"), "w").close()
-    log(".mvn/maven.config: overlay repo in front of " + m2)
-    print_prefixed(config)
+        f.write(("-Dmaven.repo.local=%s\n-Dmaven.repo.local.tail=%s\n" % (overlay, state["m2"])).encode())
+    log(".mvn/maven.config: overlay repo in front of " + state["m2"])
+    print_prefixed(CONFIG)
 
 
-def rollback(work, overlay):
+def rollback(state, overlay):
     shutil.rmtree(overlay, ignore_errors=True)
-    if os.path.exists(os.path.join(work, "config-written")):
-        config = os.path.join(".mvn", "maven.config")
-        if os.path.exists(os.path.join(work, "maven.config.orig")):
-            shutil.copyfile(os.path.join(work, "maven.config.orig"), config)
-        elif os.path.exists(config):
-            os.remove(config)
+    if state["config"] is None:  # the hook created it
+        if os.path.exists(CONFIG):
+            os.remove(CONFIG)
+    elif state["config"] is not False:  # restore it byte for byte
+        with open(CONFIG, "wb") as f:
+            f.write(state["config"])
 
 
-def main(work):
-    scan_dir = os.environ.get("MEND_SCA_SCAN_DIR", "")
-    overlay = scan_dir + "/.mvn/shaded-overlay-repo"  # excluded from the file scan, deleted with the clone
-    state = {"baseline": set(), "baseline_gav": set(), "m2": "", "processed": set(), "bundled_all": set(),
+def main(work, overlay):
+    state = {"baseline": set(), "m2": "", "processed": set(), "bundled_all": set(),
              "patches": {}, "copies": {}, "claimed": {}, "analysis": {}, "planned": set(),
              "exclusions": set(), "fetched": set(), "written": {}, "logged": {}, "warned": set(),
-             "problems": 0}
-    for n in range(1, MAX_ROUNDS + 1):
-        if not resolve(work, n):
+             "problems": 0, "config": False}  # config: False = untouched, None = created by the hook
+    try:
+        for n in range(1, MAX_ROUNDS + 1):
+            if not resolve(work, n):
+                if n == 1:
+                    return 1
+                raise Rollback("Maven failed with the patched POMs (round %d)" % n)
+            if not run_round(state, work, overlay, n, MAX_ROUNDS):
+                break
             if n == 1:
-                return 1
-            raise Rollback("Maven failed with the patched POMs (round %d)" % n)
-        try:
-            changed = run_round(state, work, overlay, n, MAX_ROUNDS)
-        except Exception:
-            traceback.print_exc()
-            raise Rollback("helper failed (round %d)" % n)
-        if not changed:
-            break
-        if n == 1:
-            if not state["m2"]:
-                raise Rollback("couldn't determine the local Maven repository")
-            add_overlay_config(work, overlay, state["m2"])
-        # published jars for the copies and POMs to patch, fetched into the real local repo
-        for artifact in needed_downloads(state, work, overlay):
-            if not mvn_run(DEP_PLUGIN + ":get", "-Dartifact=" + artifact, "-Dtransitive=false",
-                           "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
-                log("WARNING: couldn't fetch " + artifact)
-        try:
+                if not state["m2"]:
+                    raise Rollback("couldn't determine the local Maven repository")
+                add_overlay_config(state, overlay)
+            # published jars for the copies and POMs to patch, fetched into the real local repo
+            for artifact in needed_downloads(state, work, overlay):
+                if not mvn_run(DEP_PLUGIN + ":get", "-Dartifact=" + artifact, "-Dtransitive=false",
+                               "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
+                    log("WARNING: couldn't fetch " + artifact)
             materialize(state, work, overlay)
-        except Exception:
+    except Exception as e:
+        if not isinstance(e, Rollback):
             traceback.print_exc()
-            raise Rollback("helper failed (round %d)" % n)
+            e = "helper failed (round %d)" % n
+        rollback(state, overlay)
+        log("WARNING: %s; removing the overlay - shaded libraries won't be reported" % e)
+        return 1
     if not state["written"] and not any(state["copies"].values()):
-        if os.path.exists(os.path.join(work, "config-written")):
-            rollback(work, overlay)  # nothing could be reported: leave the project as it was
+        if state["config"] is not False:
+            rollback(state, overlay)  # nothing could be reported: leave the project as it was
             log("No bundled library could be reported; .mvn/maven.config restored")
         return 0  # nothing bundled anywhere
     if not state["problems"]:
@@ -648,12 +597,11 @@ def main(work):
         traceback.print_exc()
         log("WARNING: couldn't copy downloads into the local repo; they'll be reported without a SHA-1")
 
-    # final hierarchy, as the scanner's own dependency:tree will see it
-    # (informational only - a failure here doesn't fail the hook)
-    if mvn_run(DEP_PLUGIN + ":tree", "-DoutputFile=" + os.path.join(work, "tree.txt"),
-               "-DappendOutput=true", "-Dverbose"):
-        log("Dependency tree:")
-        print_prefixed(os.path.join(work, "tree.txt"))
+    # final hierarchy: the last round's tree, the agent's own (promote only
+    # adds files behind the overlay, so it can't change it)
+    log("Dependency tree:")
+    for line in tree_lines(os.path.join(work, "resolved.txt")):
+        log("  " + line)
     return 0
 
 
@@ -666,17 +614,10 @@ if __name__ == "__main__":
     repos = REPOS.split()
     if repos and "*" not in repos and repo not in repos:
         sys.exit(0)  # not one of the repositories in REPOS
-    try:
-        os.chdir(scan_dir)
-    except OSError as e:
-        print(e, file=sys.stderr)
-        sys.exit(1)
+    os.chdir(scan_dir)
+    overlay = scan_dir + "/.mvn/shaded-overlay-repo"  # excluded from the file scan, deleted with the clone
     work = tempfile.mkdtemp()
     try:
-        sys.exit(main(work))
-    except Rollback as e:
-        log("WARNING: %s; removing the overlay - shaded libraries won't be reported" % e)
-        rollback(work, os.environ.get("MEND_SCA_SCAN_DIR", "") + "/.mvn/shaded-overlay-repo")
-        sys.exit(1)
+        sys.exit(main(work, overlay))
     finally:
         shutil.rmtree(work, ignore_errors=True)

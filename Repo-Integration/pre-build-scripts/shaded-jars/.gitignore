@@ -1,3 +1,16 @@
-maven-sample/.whitesource
+# 1. Ignore absolutely everything
+*
 
-shaded-dependency-detection.md
+# 2. But do not ignore the .gitignore file itself
+!.gitignore
+
+# 3. Explicitly include specific files or extensions
+!maven-sample/pom.xml
+!README.md
+!shaded_deps_hierarchy.py
+
+
+
+
+
+
