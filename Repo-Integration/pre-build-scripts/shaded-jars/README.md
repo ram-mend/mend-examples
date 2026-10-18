@@ -23,7 +23,7 @@ The scanner runs the hook in the cloned repository before each scan. For each re
 1. **Finds bundled libraries.** It resolves the dependencies with Maven and looks inside each dependency jar for:
    - other libraries' `META-INF/maven/<groupId>/<artifactId>/pom.properties`;
    - the jar's own `pom.xml`, when it configures `maven-shade-plugin`.
-2. **Declares each one under its parent.** Each bundled library is declared under the library that declares it, through a byte-identical copy of its published jar. The copy's classifier names that parent, for example `jackson-core-2.22.1-shaded-parquet-jackson-1.18.0.jar`. As a result:
+2. **Declares each one under its parent.** Each bundled library is declared under the library that declares it, through a byte-identical copy of its published jar. The copy's classifier names that parent and every library above it, so its file name spells its whole path, for example `fastdoubleparser-2.0.1-shaded-jackson-core-2.22.1-shaded-jackson-databind-2.22.1-shaded-parquet-jackson-1.18.0.jar`. As a result:
    - a library bundled in several places appears under each parent;
    - the project's own version of a library can't hide a bundled copy.
 3. **Verifies the tree.** Maven reads the patched POMs from a temporary repository under `.mvn/`, and the hook re-resolves until every copy is in place. It then logs `Verified`.
@@ -117,6 +117,8 @@ The hook runs for every scan in the organization. It exits immediately for a rep
 - **Runtime.** The hook adds a few Maven runs to each scan of a repository it acts on; in testing this was about 10 to 30 seconds for a small project. A repository without shaded jars costs one extra `mvn dependency:list`. A multi-module repository costs one more `mvn dependency:tree`. In a repository without `pom.xml`, the hook first looks through the repository for jars. If it finds one that bundles libraries, it adds a `mvn help:evaluate`, plus a `mvn dependency:get` for each such jar whose POM isn't cached.
 - **Files in the scanner's local Maven repository.** The copies are written to the scanner's local Maven repository (`~/.m2/repository`), because the scanner identifies jars only there.
   - They are byte-identical to published jars, under coordinates that no public repository publishes.
+  - Mend's library page lists them under "Library Found In": one path for each place the library is bundled, each file name spelling that place's path.
+  - Maven keeps one POM per version. So when the same library version has bundled libraries of its own in more than one place, its copies after the first get a version of their own, `<version>-own2`, `-own3` and so on, for example `jackson-core-2.22.1-own2-shaded-jackson-databind-2.22.1-shaded-parquet-jackson-1.18.0.jar`.
   - In a repository without `pom.xml`, each jar the hook declares is copied there too, as `<artifactId>-<version>-shaded-binary-<version>.jar`. That is the committed jar itself, which may be an internal one.
   - They never overwrite existing files, stay between scans and don't affect other builds.
 - **Changes in the clone only.** The hook adds two lines to `.mvn/maven.config` and creates `.mvn/shaded-overlay-repo/`. Both are excluded from the file scan, and the scanner deletes the clone after the scan. In a repository without `pom.xml`, the hook also writes a `pom.xml` that declares the jars that bundle libraries. With `REACHABILITY` on, it also writes `.shaded-hook-reachability/` folders, one in each module whose sources import renamed classes.

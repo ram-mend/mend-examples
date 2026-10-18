@@ -32,6 +32,7 @@ ET.register_namespace("", NS)
 ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 RELOCATED = re.compile(r"^((?:.*/)?(?:shaded|repackaged|relocated)/[^/]+)/")
 CLASSIFIER_PREFIX = "shaded-"
+OWN_VERSION = "%s-own%d"  # g:a:v of a copy's POM at a version of its own, the published one being the first
 DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.6.0"
 HELP_PLUGIN = "org.apache.maven.plugins:maven-help-plugin:3.5.1"  # binary mode: where the local repo is
 BINARY_PREFIX = CLASSIFIER_PREFIX + "binary-"  # + version: a jar in the repository, declared as a copy of itself
@@ -66,11 +67,14 @@ def repo_path(repo, g, a, v, ext="pom", classifier=""):
     return os.path.join(repo, *g.split("."), a, v, name)
 
 
-def classifier_for(owner):
-    """The classifier of the copies a library (g:a:v) declares. Maven's conflict
-    key includes it, so no other version or copy of the library can drop them."""
-    g, a, v = owner.split(":")
-    return CLASSIFIER_PREFIX + a + "-" + v
+def classifier_for(patch):
+    """The classifier of the copies a POM (a state["patches"] entry) declares:
+    its library's artifactId and published version, then, if it is a copy,
+    that copy's own classifier, so a copy's file name names every library
+    above it up to the project's dependency. Maven's conflict key includes it,
+    so no other version or copy of the library can drop them."""
+    g, a, v = patch["real"].split(":")
+    return CLASSIFIER_PREFIX + a + "-" + v + ("-" + patch["cls"] if patch["cls"] else "")
 
 
 def coords(s):
@@ -209,11 +213,18 @@ def analyze(jar, g, a, v, pom_path, repos):
 def new_owner(state, gav, cls):
     """The POM identity (g:a:version) of the copy of gav with classifier cls,
     which has children: the published version for the first such copy, else a
-    version of its own, "<version>-<cls>" (copies of a version share its POM)."""
+    version of its own, "<version>-own<n>" with the smallest n no other POM of
+    that version has (copies of a version share its POM)."""
     claimant = state["claimed"].setdefault(gav, cls)
-    owner = gav if claimant == cls else gav + "-" + cls
+    owner = gav if claimant == cls else next(
+        (o for o, p in state["patches"].items() if p["real"] == gav and p["cls"] == cls), None)
+    if owner is None:
+        n = 2
+        while OWN_VERSION % (gav, n) in state["patches"]:
+            n += 1
+        owner = OWN_VERSION % (gav, n)
     if owner not in state["patches"]:
-        state["patches"][owner] = {"real": gav, "children": {}, "strip": True}
+        state["patches"][owner] = {"real": gav, "children": {}, "strip": True, "cls": cls}
         if owner != gav:
             log("Own version: %s:%s has children, and %s already uses the published POM; declared as version %s"
                 % (gav, cls, "copy " + claimant if claimant else "the project", owner.split(":")[2]))
@@ -237,7 +248,7 @@ def plan_bundle(state, jar_owner, jar_name, bundled, graph, own_deps):
     state["exclusions"] -= set(bundled)  # excluded on a copy's edge, it would drop its own copies there
 
     def declare(owner, kids, path):
-        cls = classifier_for(owner)
+        cls = classifier_for(state["patches"][owner])
         for ga in kids:
             v = bundled[ga]
             child = state["patches"][owner]["children"].setdefault(ga, {"v": v, "as": v, "node": None})
@@ -258,10 +269,10 @@ def node_owner(state, overlay, gav, cls):
     if state["patches"].get(gav, {}).get("real", gav) != gav:
         return gav
     g, a, v = gav.split(":")
-    parent = next((o for o, p in state["patches"].items() if cls and classifier_for(o) == cls
+    parent = next((o for o, p in state["patches"].items() if cls and classifier_for(p) == cls
                    and p["children"].get(g + ":" + a, {}).get("as") == v), None)
     if parent is None:  # one of the project's own artifacts
-        state["patches"].setdefault(gav, {"real": gav, "children": {}, "strip": False})
+        state["patches"].setdefault(gav, {"real": gav, "children": {}, "strip": False, "cls": ""})
         return gav
     child = state["patches"][parent]["children"][g + ":" + a]
     child["node"] = new_owner(state, gav, cls)
@@ -275,8 +286,10 @@ def node_owner(state, overlay, gav, cls):
 
 def drop_node(state, overlay, owner):
     """Forget a copy's POM and, recursively, its children's copies."""
-    patch = state["patches"].pop(owner, None) or {"children": {}}
-    cls = classifier_for(owner)
+    patch = state["patches"].pop(owner, None)
+    if patch is None:
+        return
+    cls = classifier_for(patch)
     for ga, child in patch["children"].items():
         if state["copies"].pop((ga, child["v"], cls, child["as"]), None):
             os.remove(repo_path(overlay, *ga.split(":"), child["as"], "jar", cls))
@@ -342,7 +355,7 @@ def write_pom(state, work, overlay, owner, patch):
         return  # nothing to change: the published POM stays in use
     if deps is None:
         deps = ET.SubElement(root, ns + "dependencies")
-    cls = classifier_for(owner)
+    cls = classifier_for(patch)
     for ga, child in patch["children"].items():
         dep = ET.SubElement(deps, ns + "dependency")
         cg, ca = ga.split(":")
@@ -382,7 +395,7 @@ def materialize(state, work, overlay):
         if jar is None:
             state["copies"][key] = False
             for owner, patch in list(state["patches"].items()):
-                child = patch["children"].get(ga) if classifier_for(owner) == cls else None
+                child = patch["children"].get(ga) if classifier_for(patch) == cls else None
                 if child and child["as"] == ver:
                     del patch["children"][ga]
                     if child["node"]:
@@ -451,13 +464,13 @@ def verify(state, tree, last):
     problems = 0
     for owner, patch in state["patches"].items():
         for ga, child in patch["children"].items():
-            if (owner, ga, child["as"], classifier_for(owner)) in under:
+            if (owner, ga, child["as"], classifier_for(patch)) in under:
                 continue
             problems += 1
             if (owner, ga) not in state["warned"]:
                 state["warned"].add((owner, ga))
                 log("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
-                    % (owner, ga, child["as"], classifier_for(owner)))
+                    % (owner, ga, child["as"], classifier_for(patch)))
     strays = {}  # g:a -> the copy it resolved under
     for (g, a, cls, v), p in tree:
         owner = p and "%s:%s:%s" % (p[0], p[1], p[3])
@@ -465,7 +478,7 @@ def verify(state, tree, last):
         if not patch or not patch["strip"]:
             continue  # a module, or one of the project's artifacts: its own dependencies are real
         child = patch["children"].get(g + ":" + a)
-        if not child or (cls, v) != (classifier_for(owner), child["as"]):
+        if not child or (cls, v) != (classifier_for(patch), child["as"]):
             strays.setdefault(g + ":" + a, owner)
     extras = sorted(set(strays) - state["bundled_all"] - state["exclusions"])
     for ga in sorted(set(strays) - set(extras)):  # bundled too, so excluding it would drop a copy
@@ -578,7 +591,7 @@ def plan_binaries(state, work, overlay):
                                          [state["m2"]])
         cls = BINARY_PREFIX + v
         state["claimed"][gav] = cls  # the hook's POM: a copy of this version with children gets its own
-        state["patches"][gav] = {"real": gav, "children": {}, "strip": True}
+        state["patches"][gav] = {"real": gav, "children": {}, "strip": True, "cls": ""}  # a path starts here
         state["binaries"][gav] = path
         jar = repo_path(overlay, g, a, v, "jar", cls)
         os.makedirs(os.path.dirname(jar), exist_ok=True)
