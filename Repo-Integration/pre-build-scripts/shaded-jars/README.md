@@ -40,7 +40,7 @@ A repository can hold a shaded jar as a file, with no `pom.xml` or other build, 
 ## Samples
 
 [sample-maven-projects/](./sample-maven-projects/) holds the projects the hook is tested on:
-- **[regular](./sample-maven-projects/regular/pom.xml):** a Maven project; the example above.
+- **[regular](./sample-maven-projects/regular/pom.xml):** a Maven project; the example above. Its [app](./sample-maven-projects/regular/src/main/java/com/example/App.java) calls `xstream`, and the bundled Jackson through parquet-jackson's relocated packages, for Mend's reachability analysis.
 - **[multi-module](./sample-maven-projects/multi-module/pom.xml):** two modules, `lib` and `app`, each with the regular sample's dependencies; `app` depends on `lib`.
 - **[binary-jar](./sample-maven-projects/binary-jar/README.md):** the shaded jar alone, without a `pom.xml`; its README says how to get the jar.
 

@@ -12,3 +12,6 @@
 !sample-maven-projects/*/pom.xml
 !sample-maven-projects/multi-module/*/
 !sample-maven-projects/multi-module/*/pom.xml
+!sample-maven-projects/regular/src/
+!sample-maven-projects/regular/src/**/
+!sample-maven-projects/regular/src/**/*.java
