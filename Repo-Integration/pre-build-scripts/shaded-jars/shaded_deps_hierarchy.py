@@ -7,16 +7,19 @@
 # a byte-identical copy of its published jar, classified by the library that
 # declares it; Mend matches the copies by SHA-1. The patched POMs and the
 # copies go into an overlay repo in front of the local repo (.mvn/maven.config).
-# pom.xml is never changed, and if Maven fails with the patches, everything is
-# rolled back. See README.md. Needs python3 (standard library only; tested
-# with 3.10) and Maven 3.9+.
+# An existing pom.xml is never changed; in a repository without one,
+# BINARY_JARS declares the jars in it that bundle libraries, in a pom.xml
+# written for the scan. If Maven fails with the patches, everything is rolled
+# back. See README.md. Needs python3 (standard library only; tested with 3.10)
+# and Maven 3.9+.
 #
 # The scanner executes this file directly: keep "#!/usr/bin/env python3" as
 # the first line, and Unix (LF) line endings.
 
-REPOS = ""                   # repos to run for, space-separated; "" (or "*") = every Maven repo
+REPOS = ""                   # repos to run for, space-separated; "" (or "*") = every repo
 MVN_LOG_LEVEL = ""           # Maven output: -X = debug, "" = normal, -q = errors only
 MAX_ROUNDS = 10              # bounds re-resolution (nested shading)
+BINARY_JARS = True           # in a repo without pom.xml, report what its jars bundle (writes a pom.xml for the scan)
 
 import collections, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
@@ -27,6 +30,10 @@ ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 RELOCATED = re.compile(r"^((?:.*/)?(?:shaded|repackaged|relocated)/[^/]+)/")
 CLASSIFIER_PREFIX = "shaded-"
 DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.6.0"
+HELP_PLUGIN = "org.apache.maven.plugins:maven-help-plugin:3.5.1"  # binary mode: where the local repo is
+BINARY_PREFIX = CLASSIFIER_PREFIX + "binary-"  # + version: a jar in the repository, declared as a copy of itself
+POM_PROPERTIES = re.compile(r"META-INF/maven/[^/]+/[^/]+/pom\.properties")
+BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.sbt"}
 CONFIG = os.path.join(".mvn", "maven.config")
 TREE_LINE = re.compile(r"((?:[| ]  )*[+\\]- |)(\(?[^\s:]+(?::\S+){3})")  # (prefix, g:a:type:...)
 
@@ -61,14 +68,15 @@ def coords(s):
     return (p[0], p[1], p[3], p[4]) if len(p) >= 6 else (p[0], p[1], "", p[3])
 
 
-def is_runtime(dep, ns):
-    """A <dependency> passed on to consumers."""
+def is_runtime(dep, ns, scope=""):
+    """A <dependency> passed on to consumers. scope: the one its POM's
+    dependencyManagement gives it if it sets none (<optional> isn't managed)."""
     get = lambda tag: dep.findtext(ns + tag, "").strip()
-    return get("scope") in ("", "compile", "runtime") and get("optional") != "true"
+    return (get("scope") or scope) in ("", "compile", "runtime") and get("optional") != "true"
 
 
 class Pom:
-    """A POM plus the properties and managed versions of its parent chain."""
+    """A POM plus the properties, and the managed versions and scopes, of its parent chain."""
 
     def __init__(self, data, g, v, repos):
         self.root = ET.fromstring(data)
@@ -94,8 +102,8 @@ class Pom:
         for node in reversed(chain):
             ns = ns_of(node)
             for d in node.findall("%sdependencyManagement/%sdependencies/%sdependency" % (ns, ns, ns)):
-                ga = self.expand(d.findtext(ns + "groupId")) + ":" + self.expand(d.findtext(ns + "artifactId"))
-                self.managed[ga] = self.expand(d.findtext(ns + "version"))
+                self.managed[self.key(d, ns)] = (self.expand(d.findtext(ns + "version")),
+                                                 self.expand(d.findtext(ns + "scope")))
 
     def expand(self, s):
         s = (s or "").strip()
@@ -106,32 +114,45 @@ class Pom:
             s = new
         return s
 
+    def key(self, dep, ns):
+        """Maven's dependency management key: a test-jar managed with test scope
+        doesn't make the jar of the same library a test dependency."""
+        get = lambda tag, default="": self.expand(dep.findtext(ns + tag)) or default
+        return ":".join((get("groupId"), get("artifactId"), get("type", "jar"), get("classifier")))
+
     def runtime_deps(self):
         """{g:a: version} of the dependencies passed on to consumers, in POM order."""
         ns = ns_of(self.root)
         found = {}
         for d in self.root.findall("%sdependencies/%sdependency" % (ns, ns)):
-            if is_runtime(d, ns):
-                ga = self.expand(d.findtext(ns + "groupId")) + ":" + self.expand(d.findtext(ns + "artifactId"))
-                found[ga] = self.expand(d.findtext(ns + "version")) or self.managed.get(ga, "")
+            key = self.key(d, ns)
+            version, scope = self.managed.get(key, ("", ""))
+            if is_runtime(d, ns, scope):
+                found[key.rsplit(":", 2)[0]] = self.expand(d.findtext(ns + "version")) or version
         return found
+
+
+def pom_properties(z, entry):
+    """(g, a, v) of a pom.properties in zip Z ("" where one is missing)."""
+    lines = z.read(entry).decode("utf-8", "replace").splitlines()
+    props = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("#"))
+    return tuple(props.get(k, "").strip() for k in ("groupId", "artifactId", "version"))
 
 
 def analyze(jar, g, a, v, pom_path, repos):
     """({g:a: version} of the libraries a jar bundles, {g:a: [g:a it depends on]}
     among them from their embedded POMs, [g:a] the jar's own original pom.xml
-    declares)."""
+    declares). pom_path: the published POM, or None if there is none (only
+    pom.properties then count)."""
     name, own = os.path.basename(jar), g + ":" + a
     bundled, own_deps = {}, []
     with zipfile.ZipFile(jar) as z:
         names = set(z.namelist())
         # 1. other libraries' pom.properties
         for entry in sorted(names):
-            if not re.fullmatch(r"META-INF/maven/[^/]+/[^/]+/pom\.properties", entry):
+            if not POM_PROPERTIES.fullmatch(entry):
                 continue
-            lines = z.read(entry).decode("utf-8", "replace").splitlines()
-            props = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("#"))
-            lg, la, lv = (props.get(k, "").strip() for k in ("groupId", "artifactId", "version"))
+            lg, la, lv = pom_properties(z, entry)
             if lg and la and lv and lg + ":" + la != own:
                 bundled[lg + ":" + la] = lv
                 log("Shaded in %s: %s:%s:%s" % (name, lg, la, lv))
@@ -141,7 +162,7 @@ def analyze(jar, g, a, v, pom_path, repos):
             raw = z.read(own_pom)
             declared = Pom(raw, g, v, repos).runtime_deps()
             own_deps = list(declared)
-            if b"maven-shade-plugin" in raw:
+            if b"maven-shade-plugin" in raw and pom_path:
                 with open(pom_path, "rb") as f:
                     kept = Pom(f.read(), g, v, repos).runtime_deps()
                 for ga, ver in sorted(declared.items()):
@@ -202,6 +223,7 @@ def plan_bundle(state, jar_owner, jar_name, bundled, graph, own_deps):
         "%s -> %s" % (owner.split(":")[1], ", ".join(k.split(":")[1] for k in kids))
         for owner, kids in [(jar_owner, top)] + list(kids_of.items()) if kids)))
     state["bundled_all"] |= set(bundled)
+    state["exclusions"] -= set(bundled)  # excluded on a copy's edge, it would drop its own copies there
 
     def declare(owner, kids, path):
         cls = classifier_for(owner)
@@ -326,7 +348,7 @@ def write_pom(state, work, overlay, owner, patch):
     out = repo_path(overlay, g, a, ver)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tree.write(out, xml_declaration=True, encoding="UTF-8")
-    state["written"][out] = None if own_version else orig  # None: never copied into the local repo
+    state["written"][out] = None if own_version or owner in state["binaries"] else orig  # None: never promoted
     summary = (tuple((ga, c["as"], c["node"]) for ga, c in patch["children"].items()),
                removed, tuple(sorted(state["exclusions"])))
     if state["logged"].get(owner) != summary:
@@ -409,10 +431,11 @@ def local_repo(arts):
     return ""
 
 
-def verify(state, arts, tree, last):
+def verify(state, tree, last):
     """Check that every declared copy resolved under the library that declares
-    it, and that nothing outside the jars came in with them. Returns True if
-    the POMs need rewriting."""
+    it, and that nothing else resolved under a copy with children: its POM is
+    the published one, whose parent POMs can still add dependencies the jar
+    doesn't contain. Returns True if the POMs need rewriting."""
     under = {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in tree if p}
     problems = 0
     for owner, patch in state["patches"].items():
@@ -424,9 +447,22 @@ def verify(state, arts, tree, last):
                 state["warned"].add((owner, ga))
                 log("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
                     % (owner, ga, child["as"], classifier_for(owner)))
-    plain = {g + ":" + a for g, a, cls, _, _ in arts if not cls}
-    extras = sorted(plain - state["baseline"] - state["bundled_all"] - state["exclusions"])
-    state["problems"] = problems + len(extras)
+    strays = {}  # g:a -> the copy it resolved under
+    for (g, a, cls, v), p in tree:
+        owner = p and "%s:%s:%s" % (p[0], p[1], p[3])
+        patch = state["patches"].get(owner) if owner else None
+        if not patch or not patch["strip"]:
+            continue  # a module, or one of the project's artifacts: its own dependencies are real
+        child = patch["children"].get(g + ":" + a)
+        if not child or (cls, v) != (classifier_for(owner), child["as"]):
+            strays.setdefault(g + ":" + a, owner)
+    extras = sorted(set(strays) - state["bundled_all"] - state["exclusions"])
+    for ga in sorted(set(strays) - set(extras)):  # bundled too, so excluding it would drop a copy
+        if (strays[ga], ga, "stray") not in state["warned"]:
+            state["warned"].add((strays[ga], ga, "stray"))
+            log("WARNING: %s resolves under %s, whose jar doesn't contain it, and can't be excluded there"
+                % (ga, strays[ga]))
+    state["problems"] = problems + len(strays)
     if not extras:
         return False
     log(("WARNING: resolved but not in any shaded jar: %s" if last else
@@ -437,19 +473,130 @@ def verify(state, arts, tree, last):
     return True
 
 
+MINIMAL_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n<project xmlns="%s">\n  <modelVersion>4.0.0</modelVersion>\n'
+               '  <groupId>%%s</groupId>\n  <artifactId>%%s</artifactId>\n  <version>%%s</version>\n</project>\n' % NS)
+# + the jars' own <packaging>, if any (never pom: Mend's agent skips a pom-packaged project, maven.ignorePomModules)
+PROJECT_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+               '<!-- written by the shaded-jars pre-build hook for this scan: the jars here that bundle libraries -->\n'
+               '<project xmlns="%s">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>shaded-hook</groupId>\n'
+               '  <artifactId>binaries</artifactId>\n  <version>0</version>\n%%s'
+               '  <dependencies>\n%%s  </dependencies>\n</project>\n' % NS)
+DEPENDENCY = ("    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version>"
+              "<classifier>%s</classifier></dependency>\n")
+
+
+def find_binaries():
+    """[(path, g, a, v)] of the jars in the repository that bundle libraries
+    (other libraries' pom.properties, or an own pom.xml that configures
+    maven-shade-plugin). A jar's own coordinates are the pom.properties it is
+    named after, <artifactId>-<version>.jar. None in a repository with a build
+    (BUILD_FILES) anywhere: its own scan must stay as it is, and a Maven
+    project in a subfolder would pick up the root's .mvn/maven.config."""
+    found = []
+    for dirpath, dirs, names in os.walk("."):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))  # .git, .mvn: not part of the scan
+        if BUILD_FILES & set(names):
+            return []
+        for name in sorted(n for n in names if n.endswith(".jar")):
+            path = os.path.relpath(os.path.join(dirpath, name))
+            try:
+                with zipfile.ZipFile(path) as z:
+                    libs = [pom_properties(z, e) for e in z.namelist() if POM_PROPERTIES.fullmatch(e)]
+                    own = [gav for gav in libs if name == "%s-%s.jar" % gav[1:]]
+                    own_pom = own and "META-INF/maven/%s/%s/pom.xml" % own[0][:2]
+                    shade = own_pom in z.namelist() and b"maven-shade-plugin" in z.read(own_pom)
+            except (zipfile.BadZipFile, OSError):
+                log("WARNING: %s isn't a readable jar; not inspected" % path)
+                continue
+            if own and (len(libs) > 1 or shade):
+                found.append((path,) + own[0])
+    return found
+
+
+def own_packaging(path, g, a):
+    """The <packaging> the jar's own pom.xml declares, or "" if it has none
+    (Maven's default, jar)."""
+    with zipfile.ZipFile(path) as z:
+        entry = "META-INF/maven/%s/%s/pom.xml" % (g, a)
+        if entry not in z.namelist():
+            return ""
+        root = ET.fromstring(z.read(entry))
+    return (root.findtext(ns_of(root) + "packaging") or "").strip()
+
+
+def settings_local_repo(work):
+    """The local repository Maven uses, which honours -Dmaven.repo.local: in a
+    repository without pom.xml, no resolved artifact shows it."""
+    out = os.path.join(work, "local-repo.txt")
+    if not mvn_run(HELP_PLUGIN + ":evaluate", "-Dexpression=settings.localRepository", "-Doutput=" + out,
+                   stdin=subprocess.DEVNULL) or not os.path.exists(out):
+        return ""
+    with open(out) as f:
+        return f.read().strip()
+
+
+def plan_binaries(state, work, overlay):
+    """A repository without pom.xml: declare each jar in it that bundles
+    libraries, in a pom.xml written for this scan, as a byte-identical copy of
+    itself whose POM is the hook's (no parent, no dependencies), so the rounds
+    add the bundled libraries under it and nothing else comes in. Its published
+    POM, if Maven can fetch it, only serves analyze(). False if there's nothing
+    to do (nothing changed)."""
+    binaries = {}
+    for path, g, a, v in find_binaries() if BINARY_JARS else []:
+        binaries.setdefault("%s:%s:%s" % (g, a, v), path)  # the same jar twice: once
+    if not binaries:
+        return False
+    log("Jars that bundle libraries, in a repository without pom.xml: %s"
+        % ", ".join("%s (%s)" % (path, gav) for gav, path in binaries.items()))
+    state["m2"] = settings_local_repo(work)
+    if not state["m2"]:
+        raise Rollback("couldn't determine the local Maven repository")
+    add_overlay_config(state, overlay)
+    deps, packagings = [], set()
+    for gav, path in binaries.items():
+        g, a, v = gav.split(":")
+        packagings.add(own_packaging(path, g, a))
+        published = repo_path(state["m2"], g, a, v)
+        if not os.path.exists(published) and not mvn_run(
+                DEP_PLUGIN + ":get", "-N", "-Dartifact=%s:pom" % gav, "-Dtransitive=false",
+                "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
+            log("WARNING: %s isn't published where Maven looks; only libraries with their own pom.properties "
+                "in %s are reported" % (gav, path))
+        state["analysis"][gav] = analyze(path, g, a, v, published if os.path.exists(published) else None,
+                                         [state["m2"]])
+        cls = BINARY_PREFIX + v
+        state["claimed"][gav] = cls  # the hook's POM: a copy of this version with children gets its own
+        state["patches"][gav] = {"real": gav, "children": {}, "strip": True}
+        state["binaries"][gav] = path
+        jar = repo_path(overlay, g, a, v, "jar", cls)
+        os.makedirs(os.path.dirname(jar), exist_ok=True)
+        shutil.copyfile(path, jar)
+        for out in (repo_path(overlay, g, a, v), os.path.join(work, "orig", "%s_%s_%s.pom" % (g, a, v))):
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "w") as f:
+                f.write(MINIMAL_POM % (g, a, v))
+        state["written"][repo_path(overlay, g, a, v)] = None  # never promoted
+        deps.append(DEPENDENCY % (g, a, v, cls))
+    packaging = packagings.pop() if len(packagings) == 1 else ""  # jars that disagree: Maven's default
+    state["project"] = True  # before writing, so a partial write is rolled back too
+    with open("pom.xml", "w") as f:
+        f.write(PROJECT_POM % ("  <packaging>%s</packaging>\n" % packaging if packaging else "", "".join(deps)))
+    return True
+
+
 def run_round(state, work, overlay, n, last):
     """Check the copies planned so far against Maven's output in WORK, then look
     inside every jar not seen before, copies too, top-down (so the copy nearest
     the project keeps the published version), and plan the copies each bundling
     jar declares. Returns True if another round is needed."""
-    arts = resolved_artifacts(os.path.join(work, "resolved.txt"))
-    if n == 1:
-        plain = [(g, a, v) for g, a, cls, v, _ in arts if not cls]
-        state["baseline"] = {g + ":" + a for g, a, _ in plain}
-        state["claimed"] = {"%s:%s:%s" % gav: "" for gav in plain}  # the project uses these POMs
-        state["m2"] = local_repo(arts)
+    arts = [art for art in resolved_artifacts(os.path.join(work, "resolved.txt"))
+            if (art[0], art[1], art[3]) not in state["modules"]]  # a module's jar: unbuilt, or stale
+    if n == 1:  # the project uses these POMs; a binary keeps its claim (plan_binaries)
+        state["claimed"].update({"%s:%s:%s" % (g, a, v): "" for g, a, cls, v, _ in arts if not cls})
+        state["m2"] = state["m2"] or local_repo(arts)  # plan_binaries found it already
     tree = read_tree(os.path.join(work, "resolved.txt"))
-    changed = verify(state, arts, tree, n == last) if state["patches"] else False  # none in round 1
+    changed = verify(state, tree, n == last) if state["patches"] else False  # none in round 1
     order = {node: i for i, (node, _) in enumerate(tree)}
     arts.sort(key=lambda x: order.get(x[:4], len(order)))
 
@@ -504,17 +651,52 @@ def mvn_run(*args, stdin=None):
     return subprocess.run(["mvn", "-B"] + MVN_LOG_LEVEL.split() + list(args), stdin=stdin).returncode == 0
 
 
-def resolve(work, n):
+def plan_modules(state, work):
+    """A reactor's modules, and an empty placeholder jar for each module another
+    module depends on. Nothing is built, so Maven finds a module's pom.xml but
+    not its jar, and dependency:list would fail; the tree, which reads POMs
+    only, shows both. Only the hook's own runs see WORK/stubs (repo_tail).
+    False if Maven can't read the POMs."""
+    with open("pom.xml", "rb") as f:
+        if b"<module>" not in f.read():
+            return True  # a single project
+    out = os.path.join(work, "modules.txt")
+    if not mvn_run(DEP_PLUGIN + ":tree", "-DoutputType=text", "-DoutputFile=" + out, "-DappendOutput=true"):
+        return False
+    tree = read_tree(out)
+    state["modules"] = {(g, a, v) for (g, a, _, v), parent in tree if parent is None}
+    needed = sorted({(g, a, cls, v) for (g, a, cls, v), parent in tree if parent and (g, a, v) in state["modules"]})
+    if needed:
+        state["stubs"] = os.path.join(work, "stubs")
+        for g, a, cls, v in needed:
+            path = repo_path(state["stubs"], g, a, v, "jar", cls)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            zipfile.ZipFile(path, "w").close()
+    log("Multi-module project (%d modules)%s" % (len(state["modules"]), "; Maven can't resolve a module that isn't "
+        "built, so the hook's own Maven runs use an empty placeholder jar for " + ", ".join(
+            "%s:%s%s" % (a, v, ":" + cls if cls else "") for _, a, cls, v in needed) if needed else ""))
+    return True
+
+
+def repo_tail(state):
+    """-Dmaven.repo.local.tail for the hook's own resolve runs: the placeholder
+    jars, behind the real local repo once the overlay is in front of it."""
+    return ",".join(p for p in (state["m2"], state["stubs"]) if p) if state["stubs"] else ""
+
+
+def resolve(work, n, tail=""):
     """Every resolved artifact with its file path, across all modules; from
     round 2 on also the tree as the scanner's agent gets it (-Dverbose, text),
     to check each copy sits under its parent. One Maven run, since starting
-    Maven is most of its cost: both goals append to the same file."""
+    Maven is most of its cost: both goals append to the same file. tail: local
+    repos behind the real one, for this run only (a reactor's placeholder jars)."""
     out = os.path.join(work, "resolved.txt")
     if os.path.exists(out):
         os.remove(out)
     tree = [DEP_PLUGIN + ":tree", "-Dverbose", "-DoutputType=text", "-T1"] if n > 1 else []
     return mvn_run(DEP_PLUGIN + ":list", *tree, "-DoutputAbsoluteArtifactFilename=true",
-                   "-DoutputFile=" + out, "-DappendOutput=true")
+                   "-DoutputFile=" + out, "-DappendOutput=true",
+                   *(["-Dmaven.repo.local.tail=" + tail] if tail else []))
 
 
 def print_prefixed(path):
@@ -542,6 +724,8 @@ def add_overlay_config(state, overlay):
 
 def rollback(state, overlay):
     shutil.rmtree(overlay, ignore_errors=True)
+    if state["project"] and os.path.exists("pom.xml"):
+        os.remove("pom.xml")  # the hook wrote it (plan_binaries)
     if state["config"] is None:  # the hook created it
         if os.path.exists(CONFIG):
             os.remove(CONFIG)
@@ -551,25 +735,31 @@ def rollback(state, overlay):
 
 
 def main(work, overlay):
-    state = {"baseline": set(), "m2": "", "processed": set(), "bundled_all": set(),
+    state = {"m2": "", "processed": set(), "bundled_all": set(), "modules": set(), "stubs": "",
              "patches": {}, "copies": {}, "claimed": {}, "analysis": {}, "planned": set(),
              "exclusions": set(), "fetched": set(), "written": {}, "logged": {}, "warned": set(),
+             "binaries": {}, "project": False,  # project: True = the hook wrote pom.xml
              "problems": 0, "config": False}  # config: False = untouched, None = created by the hook
     try:
         for n in range(1, MAX_ROUNDS + 1):
-            if not resolve(work, n):
-                if n == 1:
-                    return 1
+            if n == 1:
+                if not os.path.isfile("pom.xml") and not plan_binaries(state, work, overlay):
+                    return 0  # neither a Maven project nor a jar that bundles libraries
+                if not plan_modules(state, work):
+                    return 1  # Maven can't read the POMs; nothing changed yet (binary mode has no modules)
+            if not resolve(work, n, repo_tail(state)):
+                if state["config"] is False:
+                    return 1  # nothing changed yet
                 raise Rollback("Maven failed with the patched POMs (round %d)" % n)
             if not run_round(state, work, overlay, n, MAX_ROUNDS):
                 break
-            if n == 1:
+            if n == 1 and state["config"] is False:  # binary mode configured it already
                 if not state["m2"]:
                     raise Rollback("couldn't determine the local Maven repository")
                 add_overlay_config(state, overlay)
             # published jars for the copies and POMs to patch, fetched into the real local repo
             for artifact in needed_downloads(state, work, overlay):
-                if not mvn_run(DEP_PLUGIN + ":get", "-Dartifact=" + artifact, "-Dtransitive=false",
+                if not mvn_run(DEP_PLUGIN + ":get", "-N", "-Dartifact=" + artifact, "-Dtransitive=false",
                                "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
                     log("WARNING: couldn't fetch " + artifact)
             materialize(state, work, overlay)
@@ -580,11 +770,11 @@ def main(work, overlay):
         rollback(state, overlay)
         log("WARNING: %s; removing the overlay - shaded libraries won't be reported" % e)
         return 1
-    if not state["written"] and not any(state["copies"].values()):
+    if not any(state["copies"].values()) and (state["binaries"] or not state["written"]):
         if state["config"] is not False:
             rollback(state, overlay)  # nothing could be reported: leave the project as it was
-            log("No bundled library could be reported; .mvn/maven.config restored")
-        return 0  # nothing bundled anywhere
+            log("No bundled library could be reported; the hook's changes are undone")
+        return 0
     if not state["problems"]:
         edges = sum(len(p["children"]) for p in state["patches"].values())
         log("Verified: all %d bundled dependencies resolve, each as its own copy under the library "
@@ -609,8 +799,8 @@ if __name__ == "__main__":
     repo = os.environ.get("MEND_SCA_REPO_NAME", "")
     scan_dir = os.environ.get("MEND_SCA_SCAN_DIR", "")
     log("repo=%s dir=%s" % (repo, scan_dir))
-    if not os.path.isfile(os.path.join(scan_dir, "pom.xml")):
-        sys.exit(0)  # Maven projects only
+    if not os.path.isdir(scan_dir):
+        sys.exit(0)
     repos = REPOS.split()
     if repos and "*" not in repos and repo not in repos:
         sys.exit(0)  # not one of the repositories in REPOS

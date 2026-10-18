@@ -4,13 +4,11 @@
 # 2. But do not ignore the .gitignore file itself
 !.gitignore
 
-# 3. Explicitly include specific files or extensions
-!maven-sample/pom.xml
+# 3. Explicitly include the hook, its README and the sample projects
 !README.md
 !shaded_deps_hierarchy.py
-
-
-
-
-
-
+!sample-maven-projects/
+!sample-maven-projects/*/
+!sample-maven-projects/*/pom.xml
+!sample-maven-projects/multi-module/*/
+!sample-maven-projects/multi-module/*/pom.xml
