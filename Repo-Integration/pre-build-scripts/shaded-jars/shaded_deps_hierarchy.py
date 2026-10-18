@@ -10,8 +10,10 @@
 # An existing pom.xml is never changed; in a repository without one,
 # BINARY_JARS declares the jars in it that bundle libraries, in a pom.xml
 # written for the scan. If Maven fails with the patches, everything is rolled
-# back. See README.md. Needs python3 (standard library only; tested with 3.10)
-# and Maven 3.9+.
+# back. Mend's reachability analysis knows the bundled libraries' classes by
+# their original names only, so REACHABILITY writes the app's imports of
+# relocated classes under those names too. See README.md. Needs python3
+# (standard library only; tested with 3.10) and Maven 3.9+.
 #
 # The scanner executes this file directly: keep "#!/usr/bin/env python3" as
 # the first line, and Unix (LF) line endings.
@@ -20,6 +22,7 @@ REPOS = ""                   # repos to run for, space-separated; "" (or "*") = 
 MVN_LOG_LEVEL = ""           # Maven output: -X = debug, "" = normal, -q = errors only
 MAX_ROUNDS = 10              # bounds re-resolution (nested shading)
 BINARY_JARS = True           # in a repo without pom.xml, report what its jars bundle (writes a pom.xml for the scan)
+REACHABILITY = True          # write the app's imports of relocated (shaded) classes under their original names, for Mend's reachability analysis
 
 import collections, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
@@ -36,6 +39,14 @@ POM_PROPERTIES = re.compile(r"META-INF/maven/[^/]+/[^/]+/pom\.properties")
 BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.sbt"}
 CONFIG = os.path.join(".mvn", "maven.config")
 TREE_LINE = re.compile(r"((?:[| ]  )*[+\\]- |)(\(?[^\s:]+(?::\S+){3})")  # (prefix, g:a:type:...)
+REACH_DIR = ".shaded-hook-reachability"  # <module>/REACH_DIR/<path in the module>: a source file's companion
+JAVA_PACKAGE = re.compile(r"^\s*package\s+([\w$.]+)\s*;", re.M)
+JAVA_IMPORT = re.compile(r"(?:^|(?<=;))\s*import\s+(static\s+)?([\w$.]+(?:\.\*)?)\s*;", re.M)  # two on a line too
+JAVA_TYPE = re.compile(r"(?<![\w$.])(?:class|interface|enum|record|@\s*interface)\s+[\w$]")  # where the header ends
+COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+NOT_CLASSES = {"package-info.class", "module-info.class"}
+COMPANION = ("// Written by the shaded-jars pre-build hook for this scan, for Mend's reachability analysis:\n"
+             "// the imports of relocated (shaded) classes in %s, under their original names.\n%s%s")
 
 
 class Rollback(Exception):
@@ -645,6 +656,166 @@ def promote(state, overlay):
         log("Copied %d file(s) into %s, where the scanner fingerprints jars" % (copied, state["m2"]))
 
 
+def class_packages(jar):
+    """{package path: {class file names}} of a jar. META-INF/ holds
+    multi-release copies, and the default package and package-info or
+    module-info say nothing about where a library's classes went."""
+    packages = collections.defaultdict(set)
+    with zipfile.ZipFile(jar) as z:
+        for entry in z.namelist():
+            folder, _, name = entry.rpartition("/")
+            if name.endswith(".class") and name not in NOT_CLASSES and folder and not entry.startswith("META-INF/"):
+                packages[folder].add(name)
+    return packages
+
+
+def relocations(bundling_jar, bundled_jars):
+    """{relocated package: {original packages}}, dotted, of a jar that bundles
+    the libraries in BUNDLED_JARS, matched by class file names. A package of
+    the jar is relocated if no bundled jar has it (one that does kept the
+    names: a minimized bundle, or the jar's own code in a library's package),
+    and its original is a bundled package that has all its classes (a
+    minimized bundle keeps only some), never one under it (a facade's own
+    package beside the library it bundles). One whose name the relocated one
+    ends with is it; else it must be the only one, and the package must have
+    at least 3 classes, so a small package of common class names can't match
+    by chance."""
+    bundled, holders = [class_packages(jar) for jar in bundled_jars], collections.defaultdict(set)
+    for packages in bundled:
+        for p, names in packages.items():
+            for name in names:
+                holders[name].add(p)  # an index by class name, so large uber-jars stay fast
+    found = {}
+    for q, names in class_packages(bundling_jar).items():
+        if any(q in packages for packages in bundled):
+            continue
+        matches = {p for p in set.intersection(*(holders.get(name, set()) for name in names))
+                   if not p.startswith(q + "/")}
+        same_end = sorted((p for p in matches if q.endswith("/" + p)), key=len)
+        if same_end or len(matches) == 1 and len(names) >= 3:
+            found[q.replace("/", ".")] = {(same_end[-1] if same_end else matches.pop()).replace("/", ".")}
+    return found
+
+
+def derelocate(name, mapping):
+    """The original names of an imported name (a class, a nested class or a
+    static member, or a .* wildcard), by the longest relocated package it is
+    in, and again for each of those, so a bundle inside a bundle resolves;
+    every name on the way is kept, up to 10 (a mapping can grow a name for
+    ever). MAPPING: relocations() of the bundling jars."""
+    found, todo = [], [name]
+    while todo and len(found) < 10:
+        parts = todo.pop(0).split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            package = ".".join(parts[:i])
+            if package in mapping:
+                for original in sorted(mapping[package]):
+                    new = ".".join([original] + parts[i:])
+                    if new != name and new not in found:  # a loop stops here
+                        found.append(new)
+                        todo.append(new)
+                break
+    return found
+
+
+def java_imports(path):
+    """(package or None, [(static, imported name)]) of a .java file, read from
+    its header only (before the first type declaration) without comments, so
+    strings and text blocks in the code can't add imports."""
+    with open(path, encoding="utf-8-sig", errors="replace") as f:  # a byte-order mark can't hide "package"
+        text = COMMENTS.sub(" ", f.read())
+    end = JAVA_TYPE.search(text)
+    header = text[:end.start()] if end else text
+    package = JAVA_PACKAGE.search(header)
+    return (package.group(1) if package else None,
+            [(bool(m.group(1)), m.group(2)) for m in JAVA_IMPORT.finditer(header)])
+
+
+def module_root(path):
+    """The nearest folder above a source file (relative to the scan's root)
+    with a pom.xml, else the scan's root: Mend's reachability analysis reads
+    each module's sources on their own."""
+    folder = os.path.dirname(path)
+    while folder and not os.path.isfile(os.path.join(folder, "pom.xml")):
+        folder = os.path.dirname(folder)
+    return folder or "."
+
+
+def write_reachability_imports(state, work, overlay):
+    """Mend's reachability analysis links each source file, as a class named
+    by its package and file name, to the classes it imports, and finds a
+    bundled library's classes under their original names only: imports of the
+    relocated ones lead nowhere. So next to each source file with such
+    imports, write a file with the same package and file name that holds them
+    under their original names, which the analysis reads as the same class:
+    <module>/REACH_DIR/<the file's path in the module>, where the analysis'
+    exclusions (/test/, /target/...) apply to it as to the file, and which
+    Maven never compiles."""
+    sources = []
+    for dirpath, dirs, names in os.walk("."):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))  # .git, .mvn, REACH_DIR
+        sources += [os.path.relpath(os.path.join(dirpath, n)) for n in sorted(names) if n.endswith(".java")]
+    if not sources:
+        return
+    # the jars Maven resolved, a shaded classifier's (-shaded, -all...) too; not the hook's copies
+    resolved = collections.defaultdict(list)
+    for g, a, cls, v, file in resolved_artifacts(os.path.join(work, "resolved.txt")):
+        if not cls.startswith(CLASSIFIER_PREFIX) and file.endswith(".jar") and os.path.isfile(file):
+            resolved["%s:%s:%s" % (g, a, v)].append(file)
+    # from the analyses, which outlive the rounds: a copy's overlay jar may be gone (node_owner)
+    mapping = {}
+    for real, (bundled, _, _) in sorted(state["analysis"].items()):
+        if not bundled:
+            continue
+        libs = [lib for lib in (find_jar(state, overlay, ga, v) for ga, v in sorted(bundled.items())) if lib]
+        jars = [state["binaries"][real]] if real in state["binaries"] else (
+            resolved.get(real) or [find_jar(state, overlay, *real.rsplit(":", 1))])
+        for jar in jars if libs else []:
+            try:
+                found = relocations(jar, libs) if jar else {}
+            except (zipfile.BadZipFile, OSError):
+                continue  # one Maven resolved but the hook didn't inspect
+            if found:
+                q = min(found)
+                log("Relocated in %s: %d package%s of %s, e.g. %s (originally %s)" % (
+                    os.path.basename(jar), len(found), "" if len(found) == 1 else "s",
+                    ", ".join(ga.split(":")[1] for ga in sorted(bundled)), q, ", ".join(sorted(found[q]))))
+            for q, originals in found.items():
+                mapping.setdefault(q, set()).update(originals)
+    roots = []  # the relocated packages a file must mention, a subpackage with its parent
+    for q in sorted(mapping):
+        if not roots or not q.startswith(roots[-1] + "."):
+            roots.append(q)
+    written = []
+    for path in sources:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            if not any(root in text for root in roots):
+                continue
+            package, imports = java_imports(path)
+            lines = dict.fromkeys("import %s%s;\n" % ("static " if static else "", original)
+                                  for static, name in imports for original in derelocate(name, mapping))
+            if not lines:
+                continue
+            root = module_root(path)
+            folder = os.path.normpath(os.path.join(root, REACH_DIR))
+            out = os.path.join(folder, os.path.relpath(path, root))
+            if not os.path.exists(folder):
+                state["mirrors"].add(folder)  # before writing, so a partial write is removed too
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(COMPANION % (path, "package %s;\n\n" % package if package else "", "".join(lines)))
+            written.append((path, out))
+        except OSError as e:
+            log("WARNING: couldn't write the reachability imports of %s (%s); that file is skipped" % (path, e))
+    for path, out in written[:20]:
+        log("Reachability: %s: its imports of relocated classes, under their original names, in %s" % (path, out))
+    if len(written) > 20:
+        log("... and %d more" % (len(written) - 20))
+    log("Reachability: %d of %d source files import relocated classes" % (len(written), len(sources)))
+
+
 def mvn_run(*args, stdin=None):
     """Print the full command line, then run it; True if Maven succeeded."""
     log("$ mvn -B %s %s" % (MVN_LOG_LEVEL, " ".join(args)))
@@ -739,6 +910,7 @@ def main(work, overlay):
              "patches": {}, "copies": {}, "claimed": {}, "analysis": {}, "planned": set(),
              "exclusions": set(), "fetched": set(), "written": {}, "logged": {}, "warned": set(),
              "binaries": {}, "project": False,  # project: True = the hook wrote pom.xml
+             "mirrors": set(),  # the REACH_DIR folders the hook created
              "problems": 0, "config": False}  # config: False = untouched, None = created by the hook
     try:
         for n in range(1, MAX_ROUNDS + 1):
@@ -786,6 +958,17 @@ def main(work, overlay):
     except Exception:
         traceback.print_exc()
         log("WARNING: couldn't copy downloads into the local repo; they'll be reported without a SHA-1")
+
+    # best effort: without these files, reachability stays as it was; the tree stays either way
+    if REACHABILITY and any(state["copies"].values()):
+        try:
+            write_reachability_imports(state, work, overlay)
+        except Exception as e:
+            traceback.print_exc()
+            for folder in state["mirrors"]:
+                shutil.rmtree(folder, ignore_errors=True)
+            log("WARNING: couldn't write the reachability imports (%s: %s); Mend's reachability of the bundled "
+                "libraries stays as without them" % (e.__class__.__name__, e))
 
     # final hierarchy: the last round's tree, the agent's own (promote only
     # adds files behind the overlay, so it can't change it)

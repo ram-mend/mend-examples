@@ -37,6 +37,15 @@ A repository can hold a shaded jar as a file, with no `pom.xml` or other build, 
 - The copy gets a minimal POM of the hook's own, so only the libraries found in the jar come in under it.
 - The steps above then add those libraries under the jar, so Mend reports them as its transitive dependencies.
 
+### Reachability
+
+Mend's reachability analysis follows the app's `import` lines to the classes of its dependencies, and matches them by class name. A shaded jar often renames ("relocates") the packages it bundles, for example `com.fasterxml.jackson.databind` to `shaded.parquet.com.fasterxml.jackson.databind`. Mend knows a bundled library's vulnerable classes by their original names only, so the app's imports of the renamed classes never meet them, and the bundled libraries' vulnerabilities come out Unreachable even when the app calls that code.
+
+With `REACHABILITY` on (the default), the hook works around it:
+- It finds the renamed packages by comparing the class files in the jar with those of the published libraries it bundles.
+- For each source file that imports renamed classes, it writes a file with the same package and file name, holding only those imports under their original names. That file goes into a `.shaded-hook-reachability/` folder in the file's module, at the file's own path, for example `.shaded-hook-reachability/src/main/java/com/example/App.java`. Maven never compiles it.
+- Mend reads it as the same class as the source file. A reachability trace then starts at the app's class and continues in the library's original classes, for example `com.example.App → com.fasterxml.jackson.databind.ObjectMapper`.
+
 ## Samples
 
 [sample-maven-projects/](./sample-maven-projects/) holds the projects the hook is tested on:
@@ -78,6 +87,7 @@ A repository can hold a shaded jar as a file, with no `pom.xml` or other build, 
 | `MVN_LOG_LEVEL` | `""`: normal Maven output | `-X` (debug) while troubleshooting, `-q` for errors only. |
 | `MAX_ROUNDS` | `10` | Leave as is. It limits the re-resolution rounds used to follow nested shading. |
 | `BINARY_JARS` | `True`: in a repository without `pom.xml`, report what its jars bundle | `False` to leave repositories without a `pom.xml` alone. See "Repositories without pom.xml". |
+| `REACHABILITY` | `True`: write the app's imports of renamed (relocated) classes under their original names, for Mend's reachability analysis | `False` leaves the sources alone. See "Reachability". |
 
 The hook runs for every scan in the organization. It exits immediately for a repository without a `pom.xml` at its root, unless the repository has no build at all and holds a jar that bundles libraries, and, when `REPOS` is set, for a repository it doesn't list.
 
@@ -97,6 +107,8 @@ The hook runs for every scan in the organization. It exits immediately for a rep
    ```
 
    The scan log line that runs the hook contains `execution success; exit code: 0`.
+
+   For reachability (see "Reachability"), look for `Relocated in <jar>: <n> packages of <libraries>` lines, and one `Reachability: <source file>: its imports of relocated classes, under their original names, in <file>` line for each source file that imports renamed classes.
 3. **Check Mend.** The bundled libraries appear as transitive dependencies of the library that bundles them, with their vulnerabilities, in the project and in its SBOM export.
 
 ## What to expect
@@ -107,7 +119,8 @@ The hook runs for every scan in the organization. It exits immediately for a rep
   - They are byte-identical to published jars, under coordinates that no public repository publishes.
   - In a repository without `pom.xml`, each jar the hook declares is copied there too, as `<artifactId>-<version>-shaded-binary-<version>.jar`. That is the committed jar itself, which may be an internal one.
   - They never overwrite existing files, stay between scans and don't affect other builds.
-- **Changes in the clone only.** The hook adds two lines to `.mvn/maven.config` and creates `.mvn/shaded-overlay-repo/`. Both are excluded from the file scan, and the scanner deletes the clone after the scan. In a repository without `pom.xml`, the hook also writes a `pom.xml` that declares the jars that bundle libraries.
+- **Changes in the clone only.** The hook adds two lines to `.mvn/maven.config` and creates `.mvn/shaded-overlay-repo/`. Both are excluded from the file scan, and the scanner deletes the clone after the scan. In a repository without `pom.xml`, the hook also writes a `pom.xml` that declares the jars that bundle libraries. With `REACHABILITY` on, it also writes `.shaded-hook-reachability/` folders, one in each module whose sources import renamed classes.
+- **Reachability verdicts.** Existing projects may see vulnerabilities of bundled libraries move from Unreachable to Reachable. Mend matches classes by name, so another copy of the same library in the project, such as its own `jackson-core` 2.22.3, also counts as reached.
 - **If the hook fails** (a Maven error, or a jar it can't read), it removes its changes and exits 1.
   - The scan runs as if the hook weren't installed, and the SCA result shows a Warning.
   - If your check runs use `strictMode: failOnWarning`, that check fails.
@@ -122,6 +135,12 @@ The hook runs for every scan in the organization. It exits immediately for a rep
   - The `pom.xml` the hook writes takes its `<packaging>` from the jar's own `pom.xml` (Maven's default, `jar`, if it has none). A packaging that needs a Maven plugin, such as `bundle`, makes Maven fail; the hook then removes its changes and exits 1.
 - **Maven metadata needed.** Bundled libraries are found only through Maven metadata in the jar: the bundled library's `pom.properties`, or the jar's own `pom.xml` with a `maven-shade-plugin` configuration. Relocated code without metadata is only logged, as `contains relocated code with no Maven metadata`.
 - **Reported as the published library.** Bundled code is reported as the published library (matched by SHA-1), not as the relocated classes.
+- **Reachability.**
+  - Only `import` lines count, as in Mend's analysis.
+  - A renamed bundle *inside* a bundled library isn't followed, for example FastDoubleParser inside `jackson-core`. Mend's analysis doesn't follow it even without the hook.
+  - Mend matches classes by name, so reaching `com.fasterxml.jackson.core.X` also counts for any other `jackson-core` in the project, such as its own 2.22.3.
+  - Renamed packages are matched by their class files. A package with only `package-info` is skipped, and so is one whose original isn't certain: several candidates, or fewer than 3 classes and a name that doesn't end with the original's.
+  - It depends on Mend reading `.java` files in hidden folders. If that changes, reachability falls back to the results without the hook.
 - **Multi-module projects** work without a build. The jars the modules depend on are inspected, but not the modules' own jars, which aren't built when the scanner runs. For a module that another module depends on, the hook's own Maven runs use an empty placeholder jar. The scanner never sees it.
 - **Not tested:** private Maven registries and very large projects.
 
@@ -137,6 +156,7 @@ The hook runs for every scan in the organization. It exits immediately for a rep
 | `WARNING: …; removing the overlay - shaded libraries won't be reported` | The hook rolled back. The lines above it show the Maven or Python error; set `MVN_LOG_LEVEL="-X"` for more detail. |
 | `WARNING: couldn't fetch …` | The scanner can't download that published jar from your Maven repositories, so that library isn't reported. |
 | `nested deeper than MAX_ROUNDS` | Shading is nested deeper than the round limit. Increase `MAX_ROUNDS`. |
+| `WARNING: couldn't write the reachability imports …` | The hook couldn't read a source file or write the file next to it (that file is skipped), or failed otherwise (then none are written). The reported dependencies are unaffected; reachability is as without the hook. The lines above it show the error. |
 
 ## Removing the hook
 
