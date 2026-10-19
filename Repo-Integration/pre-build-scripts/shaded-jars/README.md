@@ -88,6 +88,7 @@ With `REACHABILITY` on (the default), the hook works around it:
 | `MAX_ROUNDS` | `10` | Leave as is. It limits the re-resolution rounds used to follow nested shading. |
 | `BINARY_JARS` | `True`: in a repository without `pom.xml`, report what its jars bundle | `False` to leave repositories without a `pom.xml` alone. See "Repositories without pom.xml". |
 | `REACHABILITY` | `True`: write the app's imports of renamed (relocated) classes under their original names, for Mend's reachability analysis | `False` leaves the sources alone. See "Reachability". |
+| `HARD_LINKS` | `True`: each copy of a bundled library in the scanner's local Maven repository is a hard link to the published jar, taking no disk space of its own | `False` writes full copies instead, as earlier versions of the hook did. |
 
 The hook runs for every scan in the organization. It exits immediately for a repository without a `pom.xml` at its root, unless the repository has no build at all and holds a jar that bundles libraries, and, when `REPOS` is set, for a repository it doesn't list.
 
@@ -117,6 +118,7 @@ The hook runs for every scan in the organization. It exits immediately for a rep
 - **Runtime.** The hook adds a few Maven runs to each scan of a repository it acts on; in testing this was about 10 to 30 seconds for a small project. A repository without shaded jars costs one extra `mvn dependency:list`. A multi-module repository costs one more `mvn dependency:tree`. In a repository without `pom.xml`, the hook first looks through the repository for jars. If it finds one that bundles libraries, it adds a `mvn help:evaluate`, plus a `mvn dependency:get` for each such jar whose POM isn't cached.
 - **Files in the scanner's local Maven repository.** The copies are written to the scanner's local Maven repository (`~/.m2/repository`), because the scanner identifies jars only there.
   - They are byte-identical to published jars, under coordinates that no public repository publishes.
+  - With `HARD_LINKS` on (the default), each copy of a bundled library is a hard link to the published jar, so it takes no disk space of its own. Changing `HARD_LINKS` affects only copies written afterwards; to rewrite the existing ones, delete them (step 2 of "Removing the hook"), and the next scan writes them again.
   - Mend's library page lists them under "Library Found In": one path for each place the library is bundled, each file name spelling that place's path.
   - Maven keeps one POM per version. So when the same library version has bundled libraries of its own in more than one place, its copies after the first get a version of their own, `<version>-own2`, `-own3` and so on, for example `jackson-core-2.22.1-own2-shaded-jackson-databind-2.22.1-shaded-parquet-jackson-1.18.0.jar`.
   - In a repository without `pom.xml`, each jar the hook declares is copied there too, as `<artifactId>-<version>-shaded-binary-<version>.jar`. That is the committed jar itself, which may be an internal one.
@@ -169,4 +171,4 @@ The hook runs for every scan in the organization. It exits immediately for a rep
    docker exec <scanner-container> sh -c 'find ~/.m2/repository -name "*.jar" | awk -F/ "index(\$NF, \$(NF-2) \"-\" \$(NF-1) \"-shaded-\") == 1"'
    ```
 
-   To delete them, add `| xargs rm -f` after the `awk` command, inside the quotes. The filter matches only jars named `<artifactId>-<version>-shaded-…`, so published artifacts such as `hadoop-shaded-guava` are left alone.
+   To delete them, add `| xargs rm -f` after the `awk` command, inside the quotes. The filter matches only jars named `<artifactId>-<version>-shaded-…`, so published artifacts such as `hadoop-shaded-guava` are left alone. Deleting a copy that is a hard link removes only its name; the published jar stays.

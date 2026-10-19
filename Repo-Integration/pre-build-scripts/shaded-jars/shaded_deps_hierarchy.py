@@ -12,8 +12,10 @@
 # written for the scan. If Maven fails with the patches, everything is rolled
 # back. Mend's reachability analysis knows the bundled libraries' classes by
 # their original names only, so REACHABILITY writes the app's imports of
-# relocated classes under those names too. See README.md. Needs python3
-# (standard library only; tested with 3.10) and Maven 3.9+.
+# relocated classes under those names too. With HARD_LINKS, the copies in the
+# local repo are hard links to the published jars, taking no disk space of
+# their own. See README.md. Needs python3 (standard library only; tested with
+# 3.10) and Maven 3.9+.
 #
 # The scanner executes this file directly: keep "#!/usr/bin/env python3" as
 # the first line, and Unix (LF) line endings.
@@ -23,8 +25,9 @@ MVN_LOG_LEVEL = ""           # Maven output: -X = debug, "" = normal, -q = error
 MAX_ROUNDS = 10              # bounds re-resolution (nested shading)
 BINARY_JARS = True           # in a repo without pom.xml, report what its jars bundle (writes a pom.xml for the scan)
 REACHABILITY = True          # write the app's imports of relocated (shaded) classes under their original names, for Mend's reachability analysis
+HARD_LINKS = True            # copies of published jars in the local Maven repo: hard links to the jar (no extra disk space); False = full copies
 
-import collections, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
+import collections, filecmp, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
 
 NS = "http://maven.apache.org/POM/4.0.0"
@@ -65,6 +68,33 @@ def ns_of(root):
 def repo_path(repo, g, a, v, ext="pom", classifier=""):
     name = "%s-%s%s.%s" % (a, v, "-" + classifier if classifier else "", ext)
     return os.path.join(repo, *g.split("."), a, v, name)
+
+
+def copy_aside(src, dst):
+    """Copy SRC to DST through a temporary name of this process in DST's
+    folder, so no reader (another scan's Maven) sees part of it, and a name
+    near the filesystem's 255-byte limit still fits."""
+    part = os.path.join(os.path.dirname(dst), ".%d.part" % os.getpid())
+    shutil.copyfile(src, part)
+    os.replace(part, dst)
+
+
+def link_or_copy(src, dst):
+    """Put SRC's bytes at DST, a new name: with HARD_LINKS, a hard link where
+    the filesystem allows it, so the disk holds them once under both names,
+    else a copy. If DST appeared meanwhile (another scan), a link leaves it as
+    it is, and a copy replaces it with the same bytes. True if linked."""
+    if not HARD_LINKS:
+        copy_aside(src, dst)
+        return False
+    try:
+        os.link(src, dst)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        copy_aside(src, dst)
+        return False
 
 
 def classifier_for(patch):
@@ -406,7 +436,7 @@ def materialize(state, work, overlay):
         g, a = ga.split(":")
         copy = repo_path(overlay, g, a, ver, "jar", cls)
         os.makedirs(os.path.dirname(copy), exist_ok=True)
-        shutil.copyfile(jar, copy)
+        link_or_copy(jar, copy)
         state["copies"][key] = True
         log("Copy: %s:%s:%s (byte-identical to the published %s jar)" % (ga, ver, cls, v))
     for owner, patch in state["patches"].items():
@@ -651,22 +681,39 @@ def run_round(state, work, overlay, n, last):
 
 def promote(state, overlay):
     """Copy files Maven downloaded into OVERLAY, and the copies, into the real
-    local repo (never overwriting; original POMs in place of patched ones)."""
-    copied = 0
-    for dirpath, _, files in os.walk(overlay):
-        for name in files:
-            if name.endswith(".lastUpdated") or name == "resolver-status.properties":
-                continue
-            src = os.path.join(dirpath, name)
-            dst = os.path.join(state["m2"], os.path.relpath(src, overlay))
-            if os.path.exists(dst) or state["written"].get(src, src) is None:
-                continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(state["written"].get(src, src), dst + ".part")
-            os.replace(dst + ".part", dst)
-            copied += 1
+    local repo (never overwriting; original POMs in place of patched ones).
+    With HARD_LINKS, a copy is a hard link to its published jar there
+    (promoted before the copies if Maven downloaded it into the overlay), so
+    it takes no disk space of its own. Maven writes a jar only to a new name,
+    then renames it, so nothing writes through such a link. Nothing else is
+    linked: Maven rewrites some files in place, such as _remote.repositories,
+    and the scanner's Maven would then write into the real repo through the
+    overlay."""
+    twins = {}  # overlay copy -> its published jar in the real repo
+    for (ga, v, cls, ver), done in state["copies"].items():
+        if done:
+            g, a = ga.split(":")
+            twins[repo_path(overlay, g, a, ver, "jar", cls)] = repo_path(state["m2"], g, a, v, "jar")
+    srcs = sorted((os.path.join(dirpath, name) for dirpath, _, files in os.walk(overlay) for name in files
+                   if not name.endswith(".lastUpdated") and name != "resolver-status.properties"),
+                  key=lambda src: src in twins)  # copies last
+    copied = linked = 0
+    for src in srcs:
+        dst = os.path.join(state["m2"], os.path.relpath(src, overlay))
+        if os.path.exists(dst) or state["written"].get(src, src) is None:
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        twin = twins.get(src) if HARD_LINKS else None
+        if twin and os.path.exists(twin) and (  # the same bytes, so the SHA-1 Mend matches
+                os.path.samefile(twin, src) or filecmp.cmp(twin, src, shallow=False)):
+            linked += link_or_copy(twin, dst)
+        else:
+            copy_aside(state["written"].get(src, src), dst)
+        copied += 1
     if copied:
-        log("Copied %d file(s) into %s, where the scanner fingerprints jars" % (copied, state["m2"]))
+        log("Copied %d file(s) into %s, where the scanner fingerprints jars%s" % (
+            copied, state["m2"],
+            "; %d of them are hard links to their published jar (no extra disk space)" % linked if linked else ""))
 
 
 def class_packages(jar):
