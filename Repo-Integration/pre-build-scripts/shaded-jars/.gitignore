@@ -15,3 +15,9 @@
 !sample-maven-projects/regular/src/
 !sample-maven-projects/regular/src/**/
 !sample-maven-projects/regular/src/**/*.java
+!sample-maven-projects/multi-module/lib/src/
+!sample-maven-projects/multi-module/lib/src/**/
+!sample-maven-projects/multi-module/lib/src/**/*.java
+!sample-maven-projects/multi-module/app/src/
+!sample-maven-projects/multi-module/app/src/**/
+!sample-maven-projects/multi-module/app/src/**/*.java

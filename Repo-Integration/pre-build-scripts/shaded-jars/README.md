@@ -46,11 +46,13 @@ With `REACHABILITY` on (the default), the hook works around it:
 - For each source file that imports renamed classes, it writes a file with the same package and file name, holding only those imports under their original names. That file goes into a `.shaded-hook-reachability/` folder in the file's module, at the file's own path, for example `.shaded-hook-reachability/src/main/java/com/example/App.java`. Maven never compiles it.
 - Mend reads it as the same class as the source file. A reachability trace then starts at the app's class and continues in the library's original classes, for example `com.example.App → com.fasterxml.jackson.databind.ObjectMapper`.
 
+Mend analyzes each module of a multi-module project with that module's own sources, and in testing needed no build. So the hook writes these files into each module whose sources import renamed classes. In the [multi-module sample](./sample-maven-projects/multi-module/pom.xml), only `lib`'s source does, so the file goes into `lib/.shaded-hook-reachability/`, and Mend's trace for the bundled Jackson starts at `com.example.lib.JsonUtil`.
+
 ## Samples
 
 [sample-maven-projects/](./sample-maven-projects/) holds the projects the hook is tested on:
 - **[regular](./sample-maven-projects/regular/pom.xml):** a Maven project; the example above. Its [app](./sample-maven-projects/regular/src/main/java/com/example/App.java) calls `xstream`, and the bundled Jackson through parquet-jackson's relocated packages, for Mend's reachability analysis.
-- **[multi-module](./sample-maven-projects/multi-module/pom.xml):** two modules, `lib` and `app`, each with the regular sample's dependencies; `app` depends on `lib`.
+- **[multi-module](./sample-maven-projects/multi-module/pom.xml):** two modules, `lib` and `app`, each with the regular sample's dependencies; `app` depends on `lib`. For Mend's reachability analysis, [lib's JsonUtil](./sample-maven-projects/multi-module/lib/src/main/java/com/example/lib/JsonUtil.java) calls the bundled Jackson through the relocated packages, and [app's App](./sample-maven-projects/multi-module/app/src/main/java/com/example/App.java) calls `xstream` and `JsonUtil`.
 - **[binary-jar](./sample-maven-projects/binary-jar/README.md):** the shaded jar alone, without a `pom.xml`; its README says how to get the jar.
 
 ## Requirements
