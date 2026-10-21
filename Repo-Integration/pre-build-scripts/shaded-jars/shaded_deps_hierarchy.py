@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 # shaded_deps_hierarchy.py - Mend SCA pre-build hook: reports the libraries a
 # Maven dependency bundles ("shades") inside its jar, each under the library
-# that bundles it. A shaded jar's published POM doesn't declare them, so the
-# hook finds them in the jar (other libraries' pom.properties, or the jar's own
-# pom.xml when it configures maven-shade-plugin) and declares each one through
-# a byte-identical copy of its published jar, classified by the library that
-# declares it; Mend matches the copies by SHA-1. The patched POMs and the
-# copies go into an overlay repo in front of the local repo (.mvn/maven.config).
-# An existing pom.xml is never changed; in a repository without one,
-# BINARY_JARS declares the jars in it that bundle libraries, in a pom.xml
-# written for the scan. If Maven fails with the patches, everything is rolled
-# back. Mend's reachability analysis knows the bundled libraries' classes by
-# their original names only, so REACHABILITY writes the app's imports of
-# relocated classes under those names too. With HARD_LINKS, the copies in the
-# local repo are hard links to the published jars, taking no disk space of
-# their own. See README.md. Needs python3 (standard library only; tested with
-# 3.10) and Maven 3.9+.
+# that bundles it, as byte-identical copies of their published jars (Mend
+# matches them by SHA-1) in an overlay repo in front of the local one. See
+# README.md. Needs python3 (standard library only; tested with 3.10), Maven 3.9+.
 #
 # The scanner executes this file directly: keep "#!/usr/bin/env python3" as
 # the first line, and Unix (LF) line endings.
@@ -71,38 +59,32 @@ def repo_path(repo, g, a, v, ext="pom", classifier=""):
 
 
 def copy_aside(src, dst):
-    """Copy SRC to DST through a temporary name of this process in DST's
-    folder, so no reader (another scan's Maven) sees part of it, and a name
-    near the filesystem's 255-byte limit still fits."""
+    """Copy through a temporary name in DST's folder: no other scan sees part
+    of it, and a name near the 255-byte limit fits."""
     part = os.path.join(os.path.dirname(dst), ".%d.part" % os.getpid())
     shutil.copyfile(src, part)
     os.replace(part, dst)
 
 
 def link_or_copy(src, dst):
-    """Put SRC's bytes at DST, a new name: with HARD_LINKS, a hard link where
-    the filesystem allows it, so the disk holds them once under both names,
-    else a copy. If DST appeared meanwhile (another scan), a link leaves it as
-    it is, and a copy replaces it with the same bytes. True if linked."""
-    if not HARD_LINKS:
-        copy_aside(src, dst)
-        return False
-    try:
-        os.link(src, dst)
-        return True
-    except FileExistsError:
-        return False
-    except OSError:
-        copy_aside(src, dst)
-        return False
+    """SRC's bytes at DST, a new name: with HARD_LINKS a hard link where the
+    filesystem allows one, else a copy. True if linked."""
+    if HARD_LINKS:
+        try:
+            os.link(src, dst)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            pass
+    copy_aside(src, dst)
+    return False
 
 
 def classifier_for(patch):
-    """The classifier of the copies a POM (a state["patches"] entry) declares:
-    its library's artifactId and published version, then, if it is a copy,
-    that copy's own classifier, so a copy's file name names every library
-    above it up to the project's dependency. Maven's conflict key includes it,
-    so no other version or copy of the library can drop them."""
+    """The classifier of the copies a POM (a patches entry) declares: its library
+    and published version, then its own copy's classifier, so a copy's file
+    name spells its path to the project's dependency."""
     g, a, v = patch["real"].split(":")
     return CLASSIFIER_PREFIX + a + "-" + v + ("-" + patch["cls"] if patch["cls"] else "")
 
@@ -114,8 +96,7 @@ def coords(s):
 
 
 def is_runtime(dep, ns, scope=""):
-    """A <dependency> passed on to consumers. scope: the one its POM's
-    dependencyManagement gives it if it sets none (<optional> isn't managed)."""
+    """A <dependency> passed on to consumers. scope: the managed one, if it sets none."""
     get = lambda tag: dep.findtext(ns + tag, "").strip()
     return (get("scope") or scope) in ("", "compile", "runtime") and get("optional") != "true"
 
@@ -184,12 +165,12 @@ def pom_properties(z, entry):
     return tuple(props.get(k, "").strip() for k in ("groupId", "artifactId", "version"))
 
 
-def analyze(jar, g, a, v, pom_path, repos):
+def analyze(jar, g, a, v, pom_path, repos, name=None):
     """({g:a: version} of the libraries a jar bundles, {g:a: [g:a it depends on]}
     among them from their embedded POMs, [g:a] the jar's own original pom.xml
-    declares). pom_path: the published POM, or None if there is none (only
-    pom.properties then count)."""
-    name, own = os.path.basename(jar), g + ":" + a
+    declares). pom_path: the published POM, or None (only pom.properties count).
+    name: the jar's name in the log."""
+    name, own = name or os.path.basename(jar), g + ":" + a
     bundled, own_deps = {}, []
     with zipfile.ZipFile(jar) as z:
         names = set(z.namelist())
@@ -240,209 +221,6 @@ def analyze(jar, g, a, v, pom_path, repos):
     return bundled, graph, own_deps
 
 
-def new_owner(state, gav, cls):
-    """The POM identity (g:a:version) of the copy of gav with classifier cls,
-    which has children: the published version for the first such copy, else a
-    version of its own, "<version>-own<n>" with the smallest n no other POM of
-    that version has (copies of a version share its POM)."""
-    claimant = state["claimed"].setdefault(gav, cls)
-    owner = gav if claimant == cls else next(
-        (o for o, p in state["patches"].items() if p["real"] == gav and p["cls"] == cls), None)
-    if owner is None:
-        n = 2
-        while OWN_VERSION % (gav, n) in state["patches"]:
-            n += 1
-        owner = OWN_VERSION % (gav, n)
-    if owner not in state["patches"]:
-        state["patches"][owner] = {"real": gav, "children": {}, "strip": True, "cls": cls}
-        if owner != gav:
-            log("Own version: %s:%s has children, and %s already uses the published POM; declared as version %s"
-                % (gav, cls, "copy " + claimant if claimant else "the project", owner.split(":")[2]))
-    return owner
-
-
-def plan_bundle(state, jar_owner, jar_name, bundled, graph, own_deps):
-    """Record the copies one bundling jar declares, as a tree: the jar declares
-    what its own pom.xml declares, each bundled library its own dependencies,
-    both only among the libraries in the jar; a library nobody declares is
-    declared by the jar. A library with two parents gets a copy, with its own
-    children, under each."""
-    kids_of = {ga: [d for d in graph.get(ga, []) if d in bundled and d != ga] for ga in bundled}
-    top = [ga for ga in own_deps if ga in bundled]
-    declared = set(top) | {ga for kids in kids_of.values() for ga in kids}
-    top += sorted(ga for ga in bundled if ga not in declared)
-    log("Edges in %s: %s" % (jar_name, "; ".join(
-        "%s -> %s" % (owner.split(":")[1], ", ".join(k.split(":")[1] for k in kids))
-        for owner, kids in [(jar_owner, top)] + list(kids_of.items()) if kids)))
-    state["bundled_all"] |= set(bundled)
-    state["exclusions"] -= set(bundled)  # excluded on a copy's edge, it would drop its own copies there
-
-    def declare(owner, kids, path):
-        cls = classifier_for(state["patches"][owner])
-        for ga in kids:
-            v = bundled[ga]
-            child = state["patches"][owner]["children"].setdefault(ga, {"v": v, "as": v, "node": None})
-            sub = [k for k in kids_of[ga] if k not in path]  # a dependency cycle stops here
-            if sub and child["node"] is None:
-                child["node"] = new_owner(state, ga + ":" + v, cls)
-                child["as"] = child["node"].split(":")[2]
-                declare(child["node"], sub, path | {ga})
-            state["copies"].setdefault((ga, v, cls, child["as"]), None)
-    declare(jar_owner, top, {jar_owner.rsplit(":", 1)[0]})
-
-
-def node_owner(state, overlay, gav, cls):
-    """The POM identity of a resolved artifact found to bundle libraries: its
-    own for the project's artifacts and for copies at a version of their own;
-    for a copy at the published version, see new_owner - if that is a version
-    of its own, the library declaring the copy now declares that version."""
-    if state["patches"].get(gav, {}).get("real", gav) != gav:
-        return gav
-    g, a, v = gav.split(":")
-    parent = next((o for o, p in state["patches"].items() if cls and classifier_for(p) == cls
-                   and p["children"].get(g + ":" + a, {}).get("as") == v), None)
-    if parent is None:  # one of the project's own artifacts
-        state["patches"].setdefault(gav, {"real": gav, "children": {}, "strip": False, "cls": ""})
-        return gav
-    child = state["patches"][parent]["children"][g + ":" + a]
-    child["node"] = new_owner(state, gav, cls)
-    if child["node"] != gav:
-        child["as"] = child["node"].split(":")[2]
-        if state["copies"].pop((g + ":" + a, v, cls, v), None):  # the copy at the published version
-            os.remove(repo_path(overlay, g, a, v, "jar", cls))
-        state["copies"][(g + ":" + a, v, cls, child["as"])] = None
-    return child["node"]
-
-
-def drop_node(state, overlay, owner):
-    """Forget a copy's POM and, recursively, its children's copies."""
-    patch = state["patches"].pop(owner, None)
-    if patch is None:
-        return
-    cls = classifier_for(patch)
-    for ga, child in patch["children"].items():
-        if state["copies"].pop((ga, child["v"], cls, child["as"]), None):
-            os.remove(repo_path(overlay, *ga.split(":"), child["as"], "jar", cls))
-        if child["node"]:
-            drop_node(state, overlay, child["node"])
-
-
-def find_jar(state, overlay, ga, v):
-    g, a = ga.split(":")
-    return next((p for p in (repo_path(r, g, a, v, "jar") for r in (state["m2"], overlay))
-                 if os.path.exists(p)), None)
-
-
-def original_pom(state, work, overlay, g, a, v):
-    """The published POM of g:a:v, kept in WORK/orig because the overlay copy
-    may be replaced by a patched one; None if it isn't available locally."""
-    saved = os.path.join(work, "orig", "%s_%s_%s.pom" % (g, a, v))
-    if os.path.exists(saved):
-        return saved
-    for p in (repo_path(state["m2"], g, a, v), repo_path(overlay, g, a, v)):
-        if os.path.exists(p) and p not in state["written"]:
-            os.makedirs(os.path.dirname(saved), exist_ok=True)
-            shutil.copyfile(p, saved)
-            return saved
-    return None
-
-
-def needed_downloads(state, work, overlay):
-    """Published jars needed for copies and POMs needed for patches, not yet fetched."""
-    jars = {ga + ":" + v for (ga, v, _, _), done in state["copies"].items()
-            if done is None and not find_jar(state, overlay, ga, v)}
-    poms = {p["real"] + ":pom" for p in state["patches"].values()
-            if p["real"] not in jars and original_pom(state, work, overlay, *p["real"].split(":")) is None}
-    need = sorted((jars | poms) - state["fetched"])
-    state["fetched"] |= set(need)
-    return need
-
-
-def write_pom(state, work, overlay, owner, patch):
-    """The published POM of owner, with its runtime dependencies removed when
-    it is a copy and its bundled children declared as copies (those without
-    children of their own without transitive dependencies). A copy at a
-    version of its own gets it at that version."""
-    g, a, ver = owner.split(":")
-    orig = original_pom(state, work, overlay, *patch["real"].split(":"))
-    if orig is None:
-        if patch["children"] and owner not in state["warned"]:
-            state["warned"].add(owner)
-            log("WARNING: couldn't get the published POM of %s; its bundled dependencies are not reported" % owner)
-        return
-    tree = ET.parse(orig)
-    root = tree.getroot()
-    ns = ns_of(root)
-    deps = root.find(ns + "dependencies")
-    removed = 0
-    if patch["strip"] and deps is not None:
-        for d in list(deps):
-            if d.tag == ns + "dependency" and is_runtime(d, ns):
-                deps.remove(d)
-                removed += 1
-    own_version = owner != patch["real"]
-    if not patch["children"] and not removed and not own_version:
-        return  # nothing to change: the published POM stays in use
-    if deps is None:
-        deps = ET.SubElement(root, ns + "dependencies")
-    cls = classifier_for(patch)
-    for ga, child in patch["children"].items():
-        dep = ET.SubElement(deps, ns + "dependency")
-        cg, ca = ga.split(":")
-        for tag, val in (("groupId", cg), ("artifactId", ca), ("version", child["as"]), ("classifier", cls)):
-            ET.SubElement(dep, ns + tag).text = val
-        excls = ET.SubElement(dep, ns + "exclusions")
-        for x in sorted(state["exclusions"]) if child["node"] else ["*:*"]:
-            excl = ET.SubElement(excls, ns + "exclusion")
-            xg, xa = x.split(":")
-            ET.SubElement(excl, ns + "groupId").text = xg
-            ET.SubElement(excl, ns + "artifactId").text = xa
-        if not len(excls):
-            dep.remove(excls)
-    out = repo_path(overlay, g, a, ver)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    tree.write(out, xml_declaration=True, encoding="UTF-8")
-    state["written"][out] = None if own_version or owner in state["binaries"] else orig  # None: never promoted
-    summary = (tuple((ga, c["as"], c["node"]) for ga, c in patch["children"].items()),
-               removed, tuple(sorted(state["exclusions"])))
-    if state["logged"].get(owner) != summary:
-        state["logged"][owner] = summary
-        log("Patched POM: %s declares %s%s%s" % (
-            os.path.relpath(out, overlay),
-            ", ".join("%s:%s:%s" % (ga, c["as"], cls) for ga, c in patch["children"].items()) or "nothing",
-            "; removed its %d runtime dependencies" % removed if removed else "",
-            " (the published %s POM, at this copy's own version)" % patch["real"] if own_version else ""))
-
-
-def materialize(state, work, overlay):
-    """Create the copies whose published jar is available, drop the edges to
-    those that aren't, and write every patched POM into the overlay."""
-    for key, done in list(state["copies"].items()):
-        if key not in state["copies"] or done is not None:
-            continue  # dropped below, or already done
-        ga, v, cls, ver = key
-        jar = find_jar(state, overlay, ga, v)
-        if jar is None:
-            state["copies"][key] = False
-            for owner, patch in list(state["patches"].items()):
-                child = patch["children"].get(ga) if classifier_for(patch) == cls else None
-                if child and child["as"] == ver:
-                    del patch["children"][ga]
-                    if child["node"]:
-                        drop_node(state, overlay, child["node"])
-                    log("WARNING: couldn't fetch the published %s:%s jar; it is not reported under %s"
-                        % (ga, v, owner))
-            continue
-        g, a = ga.split(":")
-        copy = repo_path(overlay, g, a, ver, "jar", cls)
-        os.makedirs(os.path.dirname(copy), exist_ok=True)
-        link_or_copy(jar, copy)
-        state["copies"][key] = True
-        log("Copy: %s:%s:%s (byte-identical to the published %s jar)" % (ga, ver, cls, v))
-    for owner, patch in state["patches"].items():
-        write_pom(state, work, overlay, owner, patch)
-
-
 def resolved_artifacts(path):
     """[(g, a, classifier, v, file)] from dependency:list -DoutputAbsoluteArtifactFilename."""
     arts = []
@@ -463,8 +241,8 @@ def tree_lines(path):
 
 def read_tree(path):
     """[(node, its parent node or None)] in tree order, each node (g, a,
-    classifier, v), from the tree in PATH. Nodes Maven omitted (in
-    parentheses, with -Dverbose) are left out: the agent doesn't send them."""
+    classifier, v). Nodes Maven omitted (in parentheses, with -Dverbose) are
+    left out: the agent doesn't send them."""
     tree, stack = [], []
     for line in tree_lines(path):
         prefix, node = TREE_LINE.match(line).groups()
@@ -485,46 +263,34 @@ def local_repo(arts):
     return ""
 
 
-def verify(state, tree, last):
-    """Check that every declared copy resolved under the library that declares
-    it, and that nothing else resolved under a copy with children: its POM is
-    the published one, whose parent POMs can still add dependencies the jar
-    doesn't contain. Returns True if the POMs need rewriting."""
-    under = {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in tree if p}
-    problems = 0
-    for owner, patch in state["patches"].items():
-        for ga, child in patch["children"].items():
-            if (owner, ga, child["as"], classifier_for(patch)) in under:
-                continue
-            problems += 1
-            if (owner, ga) not in state["warned"]:
-                state["warned"].add((owner, ga))
-                log("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
-                    % (owner, ga, child["as"], classifier_for(patch)))
-    strays = {}  # g:a -> the copy it resolved under
-    for (g, a, cls, v), p in tree:
-        owner = p and "%s:%s:%s" % (p[0], p[1], p[3])
-        patch = state["patches"].get(owner) if owner else None
-        if not patch or not patch["strip"]:
-            continue  # a module, or one of the project's artifacts: its own dependencies are real
-        child = patch["children"].get(g + ":" + a)
-        if not child or (cls, v) != (classifier_for(patch), child["as"]):
-            strays.setdefault(g + ":" + a, owner)
-    extras = sorted(set(strays) - state["bundled_all"] - state["exclusions"])
-    for ga in sorted(set(strays) - set(extras)):  # bundled too, so excluding it would drop a copy
-        if (strays[ga], ga, "stray") not in state["warned"]:
-            state["warned"].add((strays[ga], ga, "stray"))
-            log("WARNING: %s resolves under %s, whose jar doesn't contain it, and can't be excluded there"
-                % (ga, strays[ga]))
-    state["problems"] = problems + len(strays)
-    if not extras:
-        return False
-    log(("WARNING: resolved but not in any shaded jar: %s" if last else
-         "Excluding libraries the shaded jars don't contain: %s") % ", ".join(extras))
-    if last:
-        return False
-    state["exclusions"] |= set(extras)
-    return True
+def mvn_run(*args, stdin=None):
+    """Print the full command line, then run it; True if Maven succeeded."""
+    log("$ mvn -B %s %s" % (MVN_LOG_LEVEL, " ".join(args)))
+    return subprocess.run(["mvn", "-B"] + MVN_LOG_LEVEL.split() + list(args), stdin=stdin).returncode == 0
+
+
+def resolve(work, n, tail=""):
+    """Every resolved artifact with its file path, and from round 2 on the tree
+    as the scanner's agent gets it, in one Maven run (both append to
+    WORK/resolved.txt). tail: local repos behind the real one, for this run."""
+    out = os.path.join(work, "resolved.txt")
+    if os.path.exists(out):
+        os.remove(out)
+    tree = [DEP_PLUGIN + ":tree", "-Dverbose", "-DoutputType=text", "-T1"] if n > 1 else []
+    return mvn_run(DEP_PLUGIN + ":list", *tree, "-DoutputAbsoluteArtifactFilename=true",
+                   "-DoutputFile=" + out, "-DappendOutput=true",
+                   *(["-Dmaven.repo.local.tail=" + tail] if tail else []))
+
+
+def settings_local_repo(work):
+    """The local repository Maven uses, which honours -Dmaven.repo.local: in a
+    repository without pom.xml, no resolved artifact shows it."""
+    out = os.path.join(work, "local-repo.txt")
+    if not mvn_run(HELP_PLUGIN + ":evaluate", "-Dexpression=settings.localRepository", "-Doutput=" + out,
+                   stdin=subprocess.DEVNULL) or not os.path.exists(out):
+        return ""
+    with open(out) as f:
+        return f.read().strip()
 
 
 MINIMAL_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n<project xmlns="%s">\n  <modelVersion>4.0.0</modelVersion>\n'
@@ -540,12 +306,9 @@ DEPENDENCY = ("    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><
 
 
 def find_binaries():
-    """[(path, g, a, v)] of the jars in the repository that bundle libraries
-    (other libraries' pom.properties, or an own pom.xml that configures
-    maven-shade-plugin). A jar's own coordinates are the pom.properties it is
-    named after, <artifactId>-<version>.jar. None in a repository with a build
-    (BUILD_FILES) anywhere: its own scan must stay as it is, and a Maven
-    project in a subfolder would pick up the root's .mvn/maven.config."""
+    """[(path, g, a, v)] of the jars named <artifactId>-<version>.jar after their
+    own pom.properties that bundle libraries. None in a repository with a build
+    anywhere: a Maven project in a subfolder would pick up .mvn/maven.config."""
     found = []
     for dirpath, dirs, names in os.walk("."):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))  # .git, .mvn: not part of the scan
@@ -568,8 +331,7 @@ def find_binaries():
 
 
 def own_packaging(path, g, a):
-    """The <packaging> the jar's own pom.xml declares, or "" if it has none
-    (Maven's default, jar)."""
+    """The <packaging> the jar's own pom.xml declares, or "" (Maven's default, jar)."""
     with zipfile.ZipFile(path) as z:
         entry = "META-INF/maven/%s/%s/pom.xml" % (g, a)
         if entry not in z.namelist():
@@ -578,147 +340,9 @@ def own_packaging(path, g, a):
     return (root.findtext(ns_of(root) + "packaging") or "").strip()
 
 
-def settings_local_repo(work):
-    """The local repository Maven uses, which honours -Dmaven.repo.local: in a
-    repository without pom.xml, no resolved artifact shows it."""
-    out = os.path.join(work, "local-repo.txt")
-    if not mvn_run(HELP_PLUGIN + ":evaluate", "-Dexpression=settings.localRepository", "-Doutput=" + out,
-                   stdin=subprocess.DEVNULL) or not os.path.exists(out):
-        return ""
-    with open(out) as f:
-        return f.read().strip()
-
-
-def plan_binaries(state, work, overlay):
-    """A repository without pom.xml: declare each jar in it that bundles
-    libraries, in a pom.xml written for this scan, as a byte-identical copy of
-    itself whose POM is the hook's (no parent, no dependencies), so the rounds
-    add the bundled libraries under it and nothing else comes in. Its published
-    POM, if Maven can fetch it, only serves analyze(). False if there's nothing
-    to do (nothing changed)."""
-    binaries = {}
-    for path, g, a, v in find_binaries() if BINARY_JARS else []:
-        binaries.setdefault("%s:%s:%s" % (g, a, v), path)  # the same jar twice: once
-    if not binaries:
-        return False
-    log("Jars that bundle libraries, in a repository without pom.xml: %s"
-        % ", ".join("%s (%s)" % (path, gav) for gav, path in binaries.items()))
-    state["m2"] = settings_local_repo(work)
-    if not state["m2"]:
-        raise Rollback("couldn't determine the local Maven repository")
-    add_overlay_config(state, overlay)
-    deps, packagings = [], set()
-    for gav, path in binaries.items():
-        g, a, v = gav.split(":")
-        packagings.add(own_packaging(path, g, a))
-        published = repo_path(state["m2"], g, a, v)
-        if not os.path.exists(published) and not mvn_run(
-                DEP_PLUGIN + ":get", "-N", "-Dartifact=%s:pom" % gav, "-Dtransitive=false",
-                "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
-            log("WARNING: %s isn't published where Maven looks; only libraries with their own pom.properties "
-                "in %s are reported" % (gav, path))
-        state["analysis"][gav] = analyze(path, g, a, v, published if os.path.exists(published) else None,
-                                         [state["m2"]])
-        cls = BINARY_PREFIX + v
-        state["claimed"][gav] = cls  # the hook's POM: a copy of this version with children gets its own
-        state["patches"][gav] = {"real": gav, "children": {}, "strip": True, "cls": ""}  # a path starts here
-        state["binaries"][gav] = path
-        jar = repo_path(overlay, g, a, v, "jar", cls)
-        os.makedirs(os.path.dirname(jar), exist_ok=True)
-        shutil.copyfile(path, jar)
-        for out in (repo_path(overlay, g, a, v), os.path.join(work, "orig", "%s_%s_%s.pom" % (g, a, v))):
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            with open(out, "w") as f:
-                f.write(MINIMAL_POM % (g, a, v))
-        state["written"][repo_path(overlay, g, a, v)] = None  # never promoted
-        deps.append(DEPENDENCY % (g, a, v, cls))
-    packaging = packagings.pop() if len(packagings) == 1 else ""  # jars that disagree: Maven's default
-    state["project"] = True  # before writing, so a partial write is rolled back too
-    with open("pom.xml", "w") as f:
-        f.write(PROJECT_POM % ("  <packaging>%s</packaging>\n" % packaging if packaging else "", "".join(deps)))
-    return True
-
-
-def run_round(state, work, overlay, n, last):
-    """Check the copies planned so far against Maven's output in WORK, then look
-    inside every jar not seen before, copies too, top-down (so the copy nearest
-    the project keeps the published version), and plan the copies each bundling
-    jar declares. Returns True if another round is needed."""
-    arts = [art for art in resolved_artifacts(os.path.join(work, "resolved.txt"))
-            if (art[0], art[1], art[3]) not in state["modules"]]  # a module's jar: unbuilt, or stale
-    if n == 1:  # the project uses these POMs; a binary keeps its claim (plan_binaries)
-        state["claimed"].update({"%s:%s:%s" % (g, a, v): "" for g, a, cls, v, _ in arts if not cls})
-        state["m2"] = state["m2"] or local_repo(arts)  # plan_binaries found it already
-    tree = read_tree(os.path.join(work, "resolved.txt"))
-    changed = verify(state, tree, n == last) if state["patches"] else False  # none in round 1
-    order = {node: i for i, (node, _) in enumerate(tree)}
-    arts.sort(key=lambda x: order.get(x[:4], len(order)))
-
-    repos = [state["m2"], overlay]
-    for g, a, cls, v, jar in arts:
-        gav = "%s:%s:%s" % (g, a, v)
-        if (gav, cls) in state["processed"] or not jar.endswith(".jar") or not os.path.exists(jar):
-            continue
-        state["processed"].add((gav, cls))
-        real = state["patches"].get(gav, {}).get("real", gav)  # a copy's published version
-        if real not in state["analysis"]:  # copies are byte-identical: look inside once
-            pom = original_pom(state, work, overlay, *real.split(":"))
-            state["analysis"][real] = analyze(jar, *real.split(":"), pom, repos) if pom else ({}, {}, [])
-        bundled, graph, own_deps = state["analysis"][real]
-        if not bundled:
-            continue
-        if n == last:
-            log("WARNING: %s - nested deeper than MAX_ROUNDS; not reported" % os.path.basename(jar))
-            continue
-        owner = node_owner(state, overlay, gav, cls)
-        if owner in state["planned"]:
-            continue
-        state["planned"].add(owner)
-        plan_bundle(state, owner, os.path.basename(jar), bundled, graph, own_deps)
-        changed = True
-    return changed
-
-
-def promote(state, overlay):
-    """Copy files Maven downloaded into OVERLAY, and the copies, into the real
-    local repo (never overwriting; original POMs in place of patched ones).
-    With HARD_LINKS, a copy is a hard link to its published jar there
-    (promoted before the copies if Maven downloaded it into the overlay), so
-    it takes no disk space of its own. Maven writes a jar only to a new name,
-    then renames it, so nothing writes through such a link. Nothing else is
-    linked: Maven rewrites some files in place, such as _remote.repositories,
-    and the scanner's Maven would then write into the real repo through the
-    overlay."""
-    twins = {}  # overlay copy -> its published jar in the real repo
-    for (ga, v, cls, ver), done in state["copies"].items():
-        if done:
-            g, a = ga.split(":")
-            twins[repo_path(overlay, g, a, ver, "jar", cls)] = repo_path(state["m2"], g, a, v, "jar")
-    srcs = sorted((os.path.join(dirpath, name) for dirpath, _, files in os.walk(overlay) for name in files
-                   if not name.endswith(".lastUpdated") and name != "resolver-status.properties"),
-                  key=lambda src: src in twins)  # copies last
-    copied = linked = 0
-    for src in srcs:
-        dst = os.path.join(state["m2"], os.path.relpath(src, overlay))
-        if os.path.exists(dst) or state["written"].get(src, src) is None:
-            continue
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        twin = twins.get(src) if HARD_LINKS else None
-        if twin and os.path.exists(twin) and (  # the same bytes, so the SHA-1 Mend matches
-                os.path.samefile(twin, src) or filecmp.cmp(twin, src, shallow=False)):
-            linked += link_or_copy(twin, dst)
-        else:
-            copy_aside(state["written"].get(src, src), dst)
-        copied += 1
-    if copied:
-        log("Copied %d file(s) into %s, where the scanner fingerprints jars%s" % (
-            copied, state["m2"],
-            "; %d of them are hard links to their published jar (no extra disk space)" % linked if linked else ""))
-
-
 def class_packages(jar):
     """{package path: {class file names}} of a jar. META-INF/ holds
-    multi-release copies, and the default package and package-info or
+    multi-release copies, and the default package, package-info and
     module-info say nothing about where a library's classes went."""
     packages = collections.defaultdict(set)
     with zipfile.ZipFile(jar) as z:
@@ -731,15 +355,10 @@ def class_packages(jar):
 
 def relocations(bundling_jar, bundled_jars):
     """{relocated package: {original packages}}, dotted, of a jar that bundles
-    the libraries in BUNDLED_JARS, matched by class file names. A package of
-    the jar is relocated if no bundled jar has it (one that does kept the
-    names: a minimized bundle, or the jar's own code in a library's package),
-    and its original is a bundled package that has all its classes (a
-    minimized bundle keeps only some), never one under it (a facade's own
-    package beside the library it bundles). One whose name the relocated one
-    ends with is it; else it must be the only one, and the package must have
-    at least 3 classes, so a small package of common class names can't match
-    by chance."""
+    BUNDLED_JARS, matched by class file names: a package no bundled jar has,
+    whose original is a bundled package (never one under it) with all its
+    classes, the one whose name it ends with, else the only one, for a package
+    of at least 3 classes, so common class names can't match by chance."""
     bundled, holders = [class_packages(jar) for jar in bundled_jars], collections.defaultdict(set)
     for packages in bundled:
         for p, names in packages.items():
@@ -758,11 +377,9 @@ def relocations(bundling_jar, bundled_jars):
 
 
 def derelocate(name, mapping):
-    """The original names of an imported name (a class, a nested class or a
-    static member, or a .* wildcard), by the longest relocated package it is
-    in, and again for each of those, so a bundle inside a bundle resolves;
-    every name on the way is kept, up to 10 (a mapping can grow a name for
-    ever). MAPPING: relocations() of the bundling jars."""
+    """The original names of an imported name, by the longest relocated package
+    it is in, and again for each (a bundle in a bundle); up to 10, since a
+    mapping can grow a name for ever. MAPPING: relocations()."""
     found, todo = [], [name]
     while todo and len(found) < 10:
         parts = todo.pop(0).split(".")
@@ -778,12 +395,11 @@ def derelocate(name, mapping):
     return found
 
 
-def java_imports(path):
-    """(package or None, [(static, imported name)]) of a .java file, read from
-    its header only (before the first type declaration) without comments, so
-    strings and text blocks in the code can't add imports."""
-    with open(path, encoding="utf-8-sig", errors="replace") as f:  # a byte-order mark can't hide "package"
-        text = COMMENTS.sub(" ", f.read())
+def java_imports(text):
+    """(package or None, [(static, imported name)]) of a .java file's text,
+    from its header only (before the first type declaration), without
+    comments, so strings and text blocks in the code can't add imports."""
+    text = COMMENTS.sub(" ", text.lstrip("\ufeff"))  # a byte-order mark can't hide "package"
     end = JAVA_TYPE.search(text)
     header = text[:end.start()] if end else text
     package = JAVA_PACKAGE.search(header)
@@ -792,250 +408,584 @@ def java_imports(path):
 
 
 def module_root(path):
-    """The nearest folder above a source file (relative to the scan's root)
-    with a pom.xml, else the scan's root: Mend's reachability analysis reads
-    each module's sources on their own."""
+    """The nearest folder above a source file with a pom.xml, else the scan's
+    root: Mend's reachability analysis reads each module's sources on their own."""
     folder = os.path.dirname(path)
     while folder and not os.path.isfile(os.path.join(folder, "pom.xml")):
         folder = os.path.dirname(folder)
     return folder or "."
 
 
-def write_reachability_imports(state, work, overlay):
-    """Mend's reachability analysis links each source file, as a class named
-    by its package and file name, to the classes it imports, and finds a
-    bundled library's classes under their original names only: imports of the
-    relocated ones lead nowhere. So next to each source file with such
-    imports, write a file with the same package and file name that holds them
-    under their original names, which the analysis reads as the same class:
-    <module>/REACH_DIR/<the file's path in the module>, where the analysis'
-    exclusions (/test/, /target/...) apply to it as to the file, and which
-    Maven never compiles."""
-    sources = []
-    for dirpath, dirs, names in os.walk("."):
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))  # .git, .mvn, REACH_DIR
-        sources += [os.path.relpath(os.path.join(dirpath, n)) for n in sorted(names) if n.endswith(".java")]
-    if not sources:
-        return
-    # the jars Maven resolved, a shaded classifier's (-shaded, -all...) too; not the hook's copies
-    resolved = collections.defaultdict(list)
-    for g, a, cls, v, file in resolved_artifacts(os.path.join(work, "resolved.txt")):
-        if not cls.startswith(CLASSIFIER_PREFIX) and file.endswith(".jar") and os.path.isfile(file):
-            resolved["%s:%s:%s" % (g, a, v)].append(file)
-    # from the analyses, which outlive the rounds: a copy's overlay jar may be gone (node_owner)
-    mapping = {}
-    for real, (bundled, _, _) in sorted(state["analysis"].items()):
-        if not bundled:
-            continue
-        libs = [lib for lib in (find_jar(state, overlay, ga, v) for ga, v in sorted(bundled.items())) if lib]
-        jars = [state["binaries"][real]] if real in state["binaries"] else (
-            resolved.get(real) or [find_jar(state, overlay, *real.rsplit(":", 1))])
-        for jar in jars if libs else []:
-            try:
-                found = relocations(jar, libs) if jar else {}
-            except (zipfile.BadZipFile, OSError):
-                continue  # one Maven resolved but the hook didn't inspect
-            if found:
-                q = min(found)
-                log("Relocated in %s: %d package%s of %s, e.g. %s (originally %s)" % (
-                    os.path.basename(jar), len(found), "" if len(found) == 1 else "s",
-                    ", ".join(ga.split(":")[1] for ga in sorted(bundled)), q, ", ".join(sorted(found[q]))))
-            for q, originals in found.items():
-                mapping.setdefault(q, set()).update(originals)
-    roots = []  # the relocated packages a file must mention, a subpackage with its parent
-    for q in sorted(mapping):
-        if not roots or not q.startswith(roots[-1] + "."):
-            roots.append(q)
-    written = []
-    for path in sources:
+class Scan:
+    """One run of the hook: resolve the project, plan every copy, write them,
+    then check the tree Maven resolves with them; undo everything on failure."""
+
+    def __init__(self, work, overlay):
+        self.work, self.overlay = work, overlay
+        self.resolved = os.path.join(work, "resolved.txt")  # resolve()'s output
+        self.m2 = ""             # the real local repo, where the scanner fingerprints jars
+        self.modules = set()     # (g, a, v) of a reactor's modules
+        self.stubs = ""          # the folder of their placeholder jars
+        self.patches = {}        # POM g:a:v -> {real, children: {g:a: {v, as, node}}, strip, cls}
+        self.claimed = {}        # g:a:v -> the copy (classifier) using its published POM; "" = the project
+        self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
+        self.bundled_all = set()  # g:a of every library found bundled
+        self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
+        self.fetched = set()     # artifacts dependency:get ran for
+        self.warned = set()      # warnings logged once
+        self.written = set()     # the POMs the hook wrote into the overlay: never promoted
+        self.binaries = {}       # binary mode: g:a:v -> the jar's path in the repository
+        self.wrote_pom = False   # binary mode: the hook wrote pom.xml
+        self.config = False      # .mvn/maven.config's bytes before the hook; False: untouched, None: absent
+        self.mirrors = set()     # the REACH_DIR folders the hook created
+        self.round = 1
+
+    def warn_once(self, msg):
+        if msg not in self.warned:
+            self.warned.add(msg)
+            log(msg)
+
+    def run(self):
+        """0 if done or nothing to do, 1 if Maven can't resolve the project or
+        everything was rolled back."""
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            if not any(root in text for root in roots):
-                continue
-            package, imports = java_imports(path)
-            lines = dict.fromkeys("import %s%s;\n" % ("static " if static else "", original)
-                                  for static, name in imports for original in derelocate(name, mapping))
-            if not lines:
-                continue
-            root = module_root(path)
-            folder = os.path.normpath(os.path.join(root, REACH_DIR))
-            out = os.path.join(folder, os.path.relpath(path, root))
-            if not os.path.exists(folder):
-                state["mirrors"].add(folder)  # before writing, so a partial write is removed too
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            with open(out, "w", encoding="utf-8") as f:
-                f.write(COMPANION % (path, "package %s;\n\n" % package if package else "", "".join(lines)))
-            written.append((path, out))
-        except OSError as e:
-            log("WARNING: couldn't write the reachability imports of %s (%s); that file is skipped" % (path, e))
-    for path, out in written[:20]:
-        log("Reachability: %s: its imports of relocated classes, under their original names, in %s" % (path, out))
-    if len(written) > 20:
-        log("... and %d more" % (len(written) - 20))
-    log("Reachability: %d of %d source files import relocated classes" % (len(written), len(sources)))
+            if not os.path.isfile("pom.xml") and not self.plan_binaries():
+                return 0  # neither a Maven project nor a jar that bundles libraries
+            if not self.plan_modules():
+                return 1  # Maven can't read the POMs; nothing changed yet (binary mode has no modules)
+            if not resolve(self.work, 1, self.repo_tail()):
+                if self.config is False:
+                    return 1  # nothing changed yet
+                raise Rollback("Maven failed with the patched POMs (round 1)")
+            arts = [art for art in resolved_artifacts(self.resolved)
+                    if (art[0], art[1], art[3]) not in self.modules]  # a module's jar: unbuilt, or stale
+            self.m2 = self.m2 or local_repo(arts)  # plan_binaries found it already
+            self.plan(arts)
+            if not self.copies():
+                if self.patches or self.config is not False:
+                    self.rollback()
+                    log("No bundled library could be reported; the hook's changes are undone")
+                return 0
+            if self.config is False:  # binary mode configured it already
+                self.add_overlay_config()
+            self.materialize()
+            problems = self.check()
+        except Exception as e:
+            if not isinstance(e, Rollback):
+                traceback.print_exc()
+                e = "helper failed (round %d)" % self.round
+            self.rollback()
+            log("WARNING: %s; removing the overlay - shaded libraries won't be reported" % e)
+            return 1
+        if problems == 0:
+            copies = self.copies()
+            log("Verified: all %d bundled dependencies resolve, each as its own copy under the library "
+                "that declares it (%d copies)" % (len(copies), len(set(copies))))
 
+        try:  # the scanner fingerprints jars only in the real local repo
+            self.promote()
+        except Exception:
+            traceback.print_exc()
+            log("WARNING: couldn't copy downloads into the local repo; they'll be reported without a SHA-1")
 
-def mvn_run(*args, stdin=None):
-    """Print the full command line, then run it; True if Maven succeeded."""
-    log("$ mvn -B %s %s" % (MVN_LOG_LEVEL, " ".join(args)))
-    return subprocess.run(["mvn", "-B"] + MVN_LOG_LEVEL.split() + list(args), stdin=stdin).returncode == 0
+        if REACHABILITY:  # best effort: without these files, reachability stays as it was; the tree stays either way
+            try:
+                self.write_reachability_imports()
+            except Exception as e:
+                traceback.print_exc()
+                for folder in self.mirrors:
+                    shutil.rmtree(folder, ignore_errors=True)
+                log("WARNING: couldn't write the reachability imports (%s: %s); Mend's reachability of the bundled "
+                    "libraries stays as without them" % (e.__class__.__name__, e))
 
-
-def plan_modules(state, work):
-    """A reactor's modules, and an empty placeholder jar for each module another
-    module depends on. Nothing is built, so Maven finds a module's pom.xml but
-    not its jar, and dependency:list would fail; the tree, which reads POMs
-    only, shows both. Only the hook's own runs see WORK/stubs (repo_tail).
-    False if Maven can't read the POMs."""
-    with open("pom.xml", "rb") as f:
-        if b"<module>" not in f.read():
-            return True  # a single project
-    out = os.path.join(work, "modules.txt")
-    if not mvn_run(DEP_PLUGIN + ":tree", "-DoutputType=text", "-DoutputFile=" + out, "-DappendOutput=true"):
-        return False
-    tree = read_tree(out)
-    state["modules"] = {(g, a, v) for (g, a, _, v), parent in tree if parent is None}
-    needed = sorted({(g, a, cls, v) for (g, a, cls, v), parent in tree if parent and (g, a, v) in state["modules"]})
-    if needed:
-        state["stubs"] = os.path.join(work, "stubs")
-        for g, a, cls, v in needed:
-            path = repo_path(state["stubs"], g, a, v, "jar", cls)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            zipfile.ZipFile(path, "w").close()
-    log("Multi-module project (%d modules)%s" % (len(state["modules"]), "; Maven can't resolve a module that isn't "
-        "built, so the hook's own Maven runs use an empty placeholder jar for " + ", ".join(
-            "%s:%s%s" % (a, v, ":" + cls if cls else "") for _, a, cls, v in needed) if needed else ""))
-    return True
-
-
-def repo_tail(state):
-    """-Dmaven.repo.local.tail for the hook's own resolve runs: the placeholder
-    jars, behind the real local repo once the overlay is in front of it."""
-    return ",".join(p for p in (state["m2"], state["stubs"]) if p) if state["stubs"] else ""
-
-
-def resolve(work, n, tail=""):
-    """Every resolved artifact with its file path, across all modules; from
-    round 2 on also the tree as the scanner's agent gets it (-Dverbose, text),
-    to check each copy sits under its parent. One Maven run, since starting
-    Maven is most of its cost: both goals append to the same file. tail: local
-    repos behind the real one, for this run only (a reactor's placeholder jars)."""
-    out = os.path.join(work, "resolved.txt")
-    if os.path.exists(out):
-        os.remove(out)
-    tree = [DEP_PLUGIN + ":tree", "-Dverbose", "-DoutputType=text", "-T1"] if n > 1 else []
-    return mvn_run(DEP_PLUGIN + ":list", *tree, "-DoutputAbsoluteArtifactFilename=true",
-                   "-DoutputFile=" + out, "-DappendOutput=true",
-                   *(["-Dmaven.repo.local.tail=" + tail] if tail else []))
-
-
-def print_prefixed(path):
-    with open(path, errors="replace") as f:
-        for line in f.read().splitlines():
+        # the last round's tree, the agent's own (promote only adds files behind the overlay)
+        log("Dependency tree:")
+        for line in tree_lines(self.resolved):
             log("  " + line)
+        return 0
 
+    def plan_binaries(self):
+        """A repository without pom.xml: declare each jar in it that bundles
+        libraries in a pom.xml written for this scan, as a copy of itself whose
+        POM is the hook's, so nothing but the bundled libraries comes in under
+        it. Its published POM only serves analyze(). False if there's none."""
+        for path, g, a, v in find_binaries() if BINARY_JARS else []:
+            self.binaries.setdefault("%s:%s:%s" % (g, a, v), path)  # the same jar twice: once
+        if not self.binaries:
+            return False
+        log("Jars that bundle libraries, in a repository without pom.xml: %s"
+            % ", ".join("%s (%s)" % (path, gav) for gav, path in self.binaries.items()))
+        self.m2 = settings_local_repo(self.work)
+        if not self.m2:
+            raise Rollback("couldn't determine the local Maven repository")
+        self.add_overlay_config()
+        deps, packagings = [], set()
+        for gav, path in self.binaries.items():
+            g, a, v = gav.split(":")
+            packagings.add(own_packaging(path, g, a))
+            published = repo_path(self.m2, g, a, v)
+            if not os.path.exists(published) and not mvn_run(
+                    DEP_PLUGIN + ":get", "-N", "-Dartifact=%s:pom" % gav, "-Dtransitive=false",
+                    "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL):
+                log("WARNING: %s isn't published where Maven looks; only libraries with their own pom.properties "
+                    "in %s are reported" % (gav, path))
+            self.analysis[gav] = analyze(path, g, a, v, published if os.path.exists(published) else None, [self.m2])
+            cls = BINARY_PREFIX + v
+            self.claimed[gav] = cls  # the hook's POM: a copy of this version with children gets its own
+            self.patches[gav] = {"real": gav, "children": {}, "strip": True, "cls": ""}  # a path starts here
+            jar = repo_path(self.overlay, g, a, v, "jar", cls)
+            os.makedirs(os.path.dirname(jar), exist_ok=True)
+            shutil.copyfile(path, jar)
+            for out in (repo_path(self.overlay, g, a, v), os.path.join(self.work, "orig", "%s_%s_%s.pom" % (g, a, v))):
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with open(out, "w") as f:
+                    f.write(MINIMAL_POM % (g, a, v))
+            self.written.add(repo_path(self.overlay, g, a, v))
+            deps.append(DEPENDENCY % (g, a, v, cls))
+        packaging = packagings.pop() if len(packagings) == 1 else ""  # jars that disagree: Maven's default
+        self.wrote_pom = True  # before writing, so a partial write is rolled back too
+        with open("pom.xml", "w") as f:
+            f.write(PROJECT_POM % ("  <packaging>%s</packaging>\n" % packaging if packaging else "", "".join(deps)))
+        return True
 
-def add_overlay_config(state, overlay):
-    """Append the overlay settings to .mvn/maven.config, so the scanner's own
-    Maven runs see the patched POMs; state["config"] keeps the original."""
-    os.makedirs(".mvn", exist_ok=True)
-    state["config"] = None  # kept before appending, so a partial append is rolled back too
-    if os.path.exists(CONFIG):
-        with open(CONFIG, "rb") as f:
-            state["config"] = f.read()
-    with open(CONFIG, "ab") as f:
-        # keep any existing config intact, even one without a trailing newline
-        if state["config"] and not state["config"].endswith(b"\n"):
-            f.write(b"\n")
-        f.write(("-Dmaven.repo.local=%s\n-Dmaven.repo.local.tail=%s\n" % (overlay, state["m2"])).encode())
-    log(".mvn/maven.config: overlay repo in front of " + state["m2"])
-    print_prefixed(CONFIG)
+    def plan_modules(self):
+        """A reactor's modules, and an empty placeholder jar, for the hook's own
+        runs only (repo_tail), for each module another one depends on: nothing
+        is built, so dependency:list would fail. False if Maven can't read the POMs."""
+        with open("pom.xml", "rb") as f:
+            if b"<module>" not in f.read():
+                return True  # a single project
+        out = os.path.join(self.work, "modules.txt")
+        if not mvn_run(DEP_PLUGIN + ":tree", "-DoutputType=text", "-DoutputFile=" + out, "-DappendOutput=true"):
+            return False
+        tree = read_tree(out)
+        self.modules = {(g, a, v) for (g, a, _, v), parent in tree if parent is None}
+        needed = sorted({(g, a, cls, v) for (g, a, cls, v), parent in tree if parent and (g, a, v) in self.modules})
+        if needed:
+            self.stubs = os.path.join(self.work, "stubs")
+            for g, a, cls, v in needed:
+                path = repo_path(self.stubs, g, a, v, "jar", cls)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                zipfile.ZipFile(path, "w").close()
+        log("Multi-module project (%d modules)%s" % (len(self.modules), "; Maven can't resolve a module that isn't "
+            "built, so the hook's own Maven runs use an empty placeholder jar for " + ", ".join(
+                "%s:%s%s" % (a, v, ":" + cls if cls else "") for _, a, cls, v in needed) if needed else ""))
+        return True
 
+    def repo_tail(self):
+        """-Dmaven.repo.local.tail for the hook's own runs: the placeholder jars,
+        behind the real local repo once the overlay is in front of it."""
+        return ",".join(p for p in (self.m2, self.stubs) if p) if self.stubs else ""
 
-def rollback(state, overlay):
-    shutil.rmtree(overlay, ignore_errors=True)
-    if state["project"] and os.path.exists("pom.xml"):
-        os.remove("pom.xml")  # the hook wrote it (plan_binaries)
-    if state["config"] is None:  # the hook created it
+    def plan(self, arts):
+        """Plan every copy before any is written, level by level: round 1's jars
+        ARTS, then the published jars of the libraries they bundle, and so on,
+        each level's fetched first. The project's jars in list order, then depth
+        first through the copies, so the copy nearest the project keeps the
+        published POM."""
+        level, planned = {}, set()  # (analysis key, published g:a:v, jar, name in the log) -> copy's (POM, g:a)
+        for g, a, cls, v, jar in arts:
+            gav = "%s:%s:%s" % (g, a, v)
+            self.claimed.setdefault(gav, "")  # the project uses its POM, a classifier's too; a binary keeps its claim
+            if jar.endswith(".jar") and os.path.exists(jar):
+                key = gav + ":" + cls if cls and gav not in self.binaries else gav  # not the published jar
+                level.setdefault((key, gav, jar, os.path.basename(jar)), None)
+        for depth in range(1, MAX_ROUNDS + 1):
+            bundling = [(item, at) for item, at in level.items() if self.look_inside(*item)[0]]
+            if not bundling:
+                return
+            if depth == MAX_ROUNDS:
+                for (_, _, _, name), _ in bundling:
+                    log("WARNING: %s - nested deeper than MAX_ROUNDS; not reported" % name)
+                return
+            if not self.m2:
+                raise Rollback("couldn't determine the local Maven repository")
+            owners = []  # (POM, analysis key, name), each POM once
+            for (key, real, _, name), at in bundling:
+                owner = self.owner_of(real, at)
+                if owner not in planned:
+                    planned.add(owner)
+                    owners.append((owner, key, name))
+            need = []
+            for ga, v in sorted({lib for _, key, _ in owners for lib in self.analysis[key][0].items()}):
+                if not self.find_jar(ga, v):
+                    need.append("%s:%s" % (ga, v))  # brings its POM and parent POMs
+                elif not self.original_pom(*ga.split(":"), v):
+                    need.append("%s:%s:pom" % (ga, v))
+            self.fetch(need)
+            declared = []
+            for owner, key, name in owners:
+                declared += self.plan_bundle(owner, name, *self.analysis[key])
+            level = {}
+            for owner, ga in self.tree_order(declared):
+                patch, child = self.patches[owner], self.patches[owner]["children"][ga]
+                real = ga + ":" + child["v"]
+                name = os.path.basename(repo_path("", *ga.split(":"), child["as"], "jar", classifier_for(patch)))
+                level[(real, real, self.find_jar(ga, child["v"]), name)] = (owner, ga)
+
+    def look_inside(self, key, real, jar, name):
+        """analyze() of a jar, once per key: copies are byte-identical to the published jar."""
+        if key not in self.analysis:
+            pom = self.original_pom(*real.split(":"))
+            self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name)
+                                  if pom else ({}, {}, []))
+        return self.analysis[key]
+
+    def owner_of(self, real, at):
+        """The POM that declares what a jar bundles: a project artifact's own; for
+        a copy (AT: its parent POM and g:a), its node."""
+        if at is None:
+            self.patches.setdefault(real, {"real": real, "children": {}, "strip": False, "cls": ""})
+            return real
+        parent, ga = at
+        return self.node_of(self.patches[parent]["children"][ga], real, classifier_for(self.patches[parent]))
+
+    def node_of(self, child, gav, cls):
+        """The POM of a copy with children (child: a children entry), made now if it has none."""
+        if child["node"] is None:
+            child["node"] = self.new_owner(gav, cls)
+            child["as"] = child["node"].split(":")[2]
+        return child["node"]
+
+    def new_owner(self, gav, cls):
+        """The POM (g:a:version) of the copy of gav with classifier cls, which has
+        children: the published one for the first such copy (all copies of a
+        version share it), else "<version>-own<n>", the smallest n still free."""
+        claimant = self.claimed.setdefault(gav, cls)
+        owner = gav if claimant == cls else next(
+            (o for o, p in self.patches.items() if p["real"] == gav and p["cls"] == cls), None)
+        if owner is None:
+            n = 2
+            while OWN_VERSION % (gav, n) in self.patches:
+                n += 1
+            owner = OWN_VERSION % (gav, n)
+        if owner not in self.patches:
+            self.patches[owner] = {"real": gav, "children": {}, "strip": True, "cls": cls}
+            if owner != gav:
+                log("Own version: %s:%s has children, and %s already uses the published POM; declared as version %s"
+                    % (gav, cls, "copy " + claimant if claimant else "the project", owner.split(":")[2]))
+        return owner
+
+    def plan_bundle(self, jar_owner, jar_name, bundled, graph, own_deps):
+        """Declare what one jar bundles, as a tree: what its own pom.xml declares
+        and each library's own dependencies, among the libraries in the jar; the
+        jar declares the rest. A copy under each parent, none without a published
+        jar. Returns the (POM, g:a) declared."""
+        kids_of = {ga: [d for d in graph.get(ga, []) if d in bundled and d != ga] for ga in bundled}
+        top = [ga for ga in own_deps if ga in bundled]
+        declared = set(top) | {ga for kids in kids_of.values() for ga in kids}
+        top += sorted(ga for ga in bundled if ga not in declared)
+        log("Edges in %s: %s" % (jar_name, "; ".join(
+            "%s -> %s" % (owner.split(":")[1], ", ".join(k.split(":")[1] for k in kids))
+            for owner, kids in [(jar_owner, top)] + list(kids_of.items()) if kids)))
+        self.bundled_all |= set(bundled)
+        found = []
+
+        def declare(owner, kids, path):
+            cls, children = classifier_for(self.patches[owner]), self.patches[owner]["children"]
+            for ga in kids:
+                if ga not in children:  # else declared already, e.g. by the jar of its parent's parent
+                    if not self.find_jar(ga, bundled[ga]):
+                        log("WARNING: couldn't fetch the published %s:%s jar; it is not reported under %s"
+                            % (ga, bundled[ga], owner))
+                        continue
+                    children[ga] = {"v": bundled[ga], "as": bundled[ga], "node": None}
+                    found.append((owner, ga))
+                child = children[ga]
+                sub = [k for k in kids_of[ga] if k not in path]  # a dependency cycle stops here
+                if sub and child["node"] is None:
+                    declare(self.node_of(child, ga + ":" + child["v"], cls), sub, path | {ga})
+        declare(jar_owner, top, {jar_owner.rsplit(":", 1)[0]})
+        return found
+
+    def tree_order(self, pairs):
+        """PAIRS (POM, g:a) in tree order: the project's jars in list order, then
+        depth first through the copies, as Maven lists them under each."""
+        wanted, nodes, order = set(pairs), set(), []
+        for patch in self.patches.values():
+            nodes |= {child["node"] for child in patch["children"].values() if child["node"]}
+
+        def walk(owner, path):
+            for ga, child in self.patches[owner]["children"].items():
+                if (owner, ga) in wanted:
+                    wanted.discard((owner, ga))
+                    order.append((owner, ga))
+                if child["node"] and child["node"] not in path:
+                    walk(child["node"], path | {child["node"]})
+        for owner in [o for o in self.patches if o not in nodes]:
+            walk(owner, {owner})
+        return order
+
+    def check(self):
+        """Rounds 2 ... MAX_ROUNDS: resolve with the copies and verify the tree, and
+        another round only after new exclusions. The last round's problems."""
+        for n in range(2, MAX_ROUNDS + 1):
+            self.round = n
+            if not resolve(self.work, n, self.repo_tail()):
+                raise Rollback("Maven failed with the patched POMs (round %d)" % n)
+            excluded = len(self.exclusions)
+            problems = self.verify(read_tree(self.resolved), n == MAX_ROUNDS)
+            if len(self.exclusions) == excluded:
+                return problems
+            self.materialize()  # the new exclusions
+        return None  # no round left to check them
+
+    def copies(self):
+        """[(g:a, published version, classifier, declared version)] of every copy planned."""
+        return [(ga, child["v"], classifier_for(patch), child["as"])
+                for patch in self.patches.values() for ga, child in patch["children"].items()]
+
+    def fetch(self, artifacts):
+        """Fetch published jars (with their POM and parent POMs) and POMs into the
+        real local repo, once each."""
+        for artifact in sorted(set(artifacts) - self.fetched):
+            self.fetched.add(artifact)
+            if not mvn_run(DEP_PLUGIN + ":get", "-N", "-Dartifact=" + artifact, "-Dtransitive=false",
+                           "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL):
+                log("WARNING: couldn't fetch " + artifact)
+
+    def find_jar(self, ga, v, cls=""):
+        """A published jar in the real local repo, where round 1 and fetch put them; None if missing."""
+        path = repo_path(self.m2, *ga.split(":"), v, "jar", cls)
+        return path if os.path.exists(path) else None
+
+    def original_pom(self, g, a, v):
+        """The published POM of g:a:v in the real local repo (a binary's: the
+        hook's own, kept in WORK/orig); None if missing."""
+        for p in (os.path.join(self.work, "orig", "%s_%s_%s.pom" % (g, a, v)), repo_path(self.m2, g, a, v)):
+            if os.path.exists(p):
+                return p
+        return None
+
+    def materialize(self):
+        """Write the copies not written yet, then every patched POM, into the overlay."""
+        for ga, v, cls, ver in self.copies():
+            g, a = ga.split(":")
+            copy = repo_path(self.overlay, g, a, ver, "jar", cls)
+            if not os.path.exists(copy):
+                os.makedirs(os.path.dirname(copy), exist_ok=True)
+                link_or_copy(self.find_jar(ga, v), copy)
+                log("Copy: %s:%s:%s (byte-identical to the published %s jar)" % (ga, ver, cls, v))
+        for owner in self.patches:
+            self.write_pom(owner)
+
+    def write_pom(self, owner):
+        """The published POM of owner, its children declared as copies (*:* on a
+        leaf), its runtime dependencies removed if it is a copy, at its own
+        version if it has one. Written, and logged, only when it changes."""
+        g, a, ver = owner.split(":")
+        patch = self.patches[owner]
+        orig = self.original_pom(*patch["real"].split(":"))
+        if orig is None:
+            if patch["children"]:
+                self.warn_once("WARNING: couldn't get the published POM of %s; its bundled dependencies are not "
+                               "reported" % owner)
+            return
+        root = ET.parse(orig).getroot()
+        ns = ns_of(root)
+        deps = root.find(ns + "dependencies")
+        removed = 0
+        if patch["strip"] and deps is not None:
+            for d in list(deps):
+                if d.tag == ns + "dependency" and is_runtime(d, ns):
+                    deps.remove(d)
+                    removed += 1
+        own_version = owner != patch["real"]
+        if not patch["children"] and not removed and not own_version:
+            return  # nothing to change: the published POM stays in use
+        if deps is None:
+            deps = ET.SubElement(root, ns + "dependencies")
+        cls = classifier_for(patch)
+        for ga, child in patch["children"].items():
+            dep = ET.SubElement(deps, ns + "dependency")
+            cg, ca = ga.split(":")
+            for tag, val in (("groupId", cg), ("artifactId", ca), ("version", child["as"]), ("classifier", cls)):
+                ET.SubElement(dep, ns + tag).text = val
+            excls = ET.SubElement(dep, ns + "exclusions")
+            for x in sorted(self.exclusions) if child["node"] else ["*:*"]:
+                excl = ET.SubElement(excls, ns + "exclusion")
+                xg, xa = x.split(":")
+                ET.SubElement(excl, ns + "groupId").text = xg
+                ET.SubElement(excl, ns + "artifactId").text = xa
+            if not len(excls):
+                dep.remove(excls)
+        data = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+        out = repo_path(self.overlay, g, a, ver)
+        if out in self.written and os.path.exists(out):
+            with open(out, "rb") as f:
+                if f.read() == data:
+                    return  # unchanged since the last round
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(data)
+        self.written.add(out)
+        log("Patched POM: %s declares %s%s%s" % (
+            os.path.relpath(out, self.overlay),
+            ", ".join("%s:%s:%s" % (ga, c["as"], cls) for ga, c in patch["children"].items()) or "nothing",
+            "; removed its %d runtime dependencies" % removed if removed else "",
+            " (the published %s POM, at this copy's own version)" % patch["real"] if own_version else ""))
+
+    def verify(self, tree, last):
+        """The problems in TREE: a declared copy not resolved under its parent, or
+        a stray under a copy with children (from its POM's parents). A stray is
+        excluded, unless this is the LAST round or it's bundled somewhere."""
+        under = {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in tree if p}
+        problems = 0
+        for owner, patch in self.patches.items():
+            cls = classifier_for(patch)
+            for ga, child in patch["children"].items():
+                if (owner, ga, child["as"], cls) not in under:
+                    problems += 1
+                    self.warn_once("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
+                                   % (owner, ga, child["as"], cls))
+        strays = {}  # g:a -> the copy it resolved under
+        for (g, a, cls, v), p in tree:
+            owner = p and "%s:%s:%s" % (p[0], p[1], p[3])
+            patch = self.patches.get(owner) if owner else None
+            if not patch or not patch["strip"]:
+                continue  # a module, or one of the project's artifacts: its own dependencies are real
+            child = patch["children"].get(g + ":" + a)
+            if not child or (cls, v) != (classifier_for(patch), child["as"]):
+                strays.setdefault(g + ":" + a, owner)
+        extras = sorted(set(strays) - self.bundled_all - self.exclusions)
+        for ga in sorted(set(strays) - set(extras)):
+            self.warn_once("WARNING: %s resolves under %s, whose jar doesn't contain it, and can't be excluded there"
+                           % (ga, strays[ga]))
+        if extras:
+            log(("WARNING: resolved but not in any shaded jar: %s" if last else
+                 "Excluding libraries the shaded jars don't contain: %s") % ", ".join(extras))
+            if not last:
+                self.exclusions |= set(extras)
+        return problems + len(strays)
+
+    def promote(self):
+        """Copy the overlay's new files into the real local repo, never
+        overwriting and never a POM the hook wrote. With HARD_LINKS a copy is a
+        hard link to its published jar (Maven only renames jars into place);
+        nothing else is, as Maven rewrites some files in place."""
+        twins = {repo_path(self.overlay, *ga.split(":"), ver, "jar", cls): repo_path(self.m2, *ga.split(":"), v, "jar")
+                 for ga, v, cls, ver in self.copies()}  # overlay copy -> its published jar in the real repo
+        srcs = sorted(os.path.join(dirpath, name) for dirpath, _, files in os.walk(self.overlay) for name in files
+                      if not name.endswith(".lastUpdated") and name != "resolver-status.properties")
+        copied = linked = 0
+        for src in srcs:
+            dst = os.path.join(self.m2, os.path.relpath(src, self.overlay))
+            if os.path.exists(dst) or src in self.written:
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            twin = twins.get(src) if HARD_LINKS else None
+            if twin and os.path.exists(twin) and (  # the same bytes, so the SHA-1 Mend matches
+                    os.path.samefile(twin, src) or filecmp.cmp(twin, src, shallow=False)):
+                linked += link_or_copy(twin, dst)
+            else:
+                copy_aside(src, dst)
+            copied += 1
+        if copied:
+            log("Copied %d file(s) into %s, where the scanner fingerprints jars%s" % (
+                copied, self.m2,
+                "; %d of them are hard links to their published jar (no extra disk space)" % linked if linked else ""))
+
+    def write_reachability_imports(self):
+        """Mend's reachability analysis knows a bundled library's classes by their
+        original names only. So for each source file that imports relocated
+        classes, write one with the same package and file name that imports them
+        under those names, at <module>/REACH_DIR/<its path in the module>."""
+        sources = []
+        for dirpath, dirs, names in os.walk("."):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))  # .git, .mvn, REACH_DIR
+            sources += [os.path.relpath(os.path.join(dirpath, n)) for n in sorted(names) if n.endswith(".java")]
+        if not sources:
+            return
+        # the jars Maven resolved, keyed as self.analysis, a shaded classifier's (-shaded, -all...) too; not copies
+        resolved = collections.defaultdict(list)
+        for g, a, cls, v, file in resolved_artifacts(self.resolved):
+            if not cls.startswith(CLASSIFIER_PREFIX) and file.endswith(".jar") and os.path.isfile(file):
+                resolved["%s:%s:%s" % (g, a, v) + (":" + cls if cls else "")].append(file)
+        mapping = {}
+        for key, (bundled, _, _) in sorted(self.analysis.items()):
+            if not bundled:
+                continue
+            libs = [lib for lib in (self.find_jar(ga, v) for ga, v in sorted(bundled.items())) if lib]
+            g, a, v, cls = (key.split(":") + [""])[:4]
+            jars = [self.binaries[key]] if key in self.binaries else (
+                resolved.get(key) or [self.find_jar(g + ":" + a, v, cls)])
+            for jar in jars if libs else []:
+                try:
+                    found = relocations(jar, libs) if jar else {}
+                except (zipfile.BadZipFile, OSError):
+                    continue  # one Maven resolved but the hook didn't inspect
+                if found:
+                    q = min(found)
+                    log("Relocated in %s: %d package%s of %s, e.g. %s (originally %s)" % (
+                        os.path.basename(jar), len(found), "" if len(found) == 1 else "s",
+                        ", ".join(ga.split(":")[1] for ga in sorted(bundled)), q, ", ".join(sorted(found[q]))))
+                for q, originals in found.items():
+                    mapping.setdefault(q, set()).update(originals)
+        roots = []  # the relocated packages a file must mention, a subpackage with its parent
+        for q in sorted(mapping):
+            if not roots or not q.startswith(roots[-1] + "."):
+                roots.append(q)
+        written = []
+        for path in sources:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                if not any(root in text for root in roots):
+                    continue
+                package, imports = java_imports(text)
+                lines = dict.fromkeys("import %s%s;\n" % ("static " if static else "", original)
+                                      for static, name in imports for original in derelocate(name, mapping))
+                if not lines:
+                    continue
+                root = module_root(path)
+                folder = os.path.normpath(os.path.join(root, REACH_DIR))
+                out = os.path.join(folder, os.path.relpath(path, root))
+                if not os.path.exists(folder):
+                    self.mirrors.add(folder)  # before writing, so a partial write is removed too
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(COMPANION % (path, "package %s;\n\n" % package if package else "", "".join(lines)))
+                written.append((path, out))
+            except OSError as e:
+                log("WARNING: couldn't write the reachability imports of %s (%s); that file is skipped" % (path, e))
+        for path, out in written[:20]:
+            log("Reachability: %s: its imports of relocated classes, under their original names, in %s" % (path, out))
+        if len(written) > 20:
+            log("... and %d more" % (len(written) - 20))
+        log("Reachability: %d of %d source files import relocated classes" % (len(written), len(sources)))
+
+    def add_overlay_config(self):
+        """Append the overlay settings to .mvn/maven.config, so the scanner's own
+        Maven runs see the patched POMs; self.config keeps the original."""
+        os.makedirs(".mvn", exist_ok=True)
+        self.config = None  # kept before appending, so a partial append is rolled back too
         if os.path.exists(CONFIG):
-            os.remove(CONFIG)
-    elif state["config"] is not False:  # restore it byte for byte
-        with open(CONFIG, "wb") as f:
-            f.write(state["config"])
+            with open(CONFIG, "rb") as f:
+                self.config = f.read()
+        with open(CONFIG, "ab") as f:
+            # keep any existing config intact, even one without a trailing newline
+            if self.config and not self.config.endswith(b"\n"):
+                f.write(b"\n")
+            f.write(("-Dmaven.repo.local=%s\n-Dmaven.repo.local.tail=%s\n" % (self.overlay, self.m2)).encode())
+        log(".mvn/maven.config: overlay repo in front of " + self.m2)
+        with open(CONFIG, errors="replace") as f:
+            for line in f.read().splitlines():
+                log("  " + line)
+
+    def rollback(self):
+        shutil.rmtree(self.overlay, ignore_errors=True)
+        if self.wrote_pom and os.path.exists("pom.xml"):
+            os.remove("pom.xml")  # the hook wrote it (plan_binaries)
+        if self.config is None:  # the hook created it
+            if os.path.exists(CONFIG):
+                os.remove(CONFIG)
+        elif self.config is not False:  # restore it byte for byte
+            with open(CONFIG, "wb") as f:
+                f.write(self.config)
 
 
 def main(work, overlay):
-    state = {"m2": "", "processed": set(), "bundled_all": set(), "modules": set(), "stubs": "",
-             "patches": {}, "copies": {}, "claimed": {}, "analysis": {}, "planned": set(),
-             "exclusions": set(), "fetched": set(), "written": {}, "logged": {}, "warned": set(),
-             "binaries": {}, "project": False,  # project: True = the hook wrote pom.xml
-             "mirrors": set(),  # the REACH_DIR folders the hook created
-             "problems": 0, "config": False}  # config: False = untouched, None = created by the hook
-    try:
-        for n in range(1, MAX_ROUNDS + 1):
-            if n == 1:
-                if not os.path.isfile("pom.xml") and not plan_binaries(state, work, overlay):
-                    return 0  # neither a Maven project nor a jar that bundles libraries
-                if not plan_modules(state, work):
-                    return 1  # Maven can't read the POMs; nothing changed yet (binary mode has no modules)
-            if not resolve(work, n, repo_tail(state)):
-                if state["config"] is False:
-                    return 1  # nothing changed yet
-                raise Rollback("Maven failed with the patched POMs (round %d)" % n)
-            if not run_round(state, work, overlay, n, MAX_ROUNDS):
-                break
-            if n == 1 and state["config"] is False:  # binary mode configured it already
-                if not state["m2"]:
-                    raise Rollback("couldn't determine the local Maven repository")
-                add_overlay_config(state, overlay)
-            # published jars for the copies and POMs to patch, fetched into the real local repo
-            for artifact in needed_downloads(state, work, overlay):
-                if not mvn_run(DEP_PLUGIN + ":get", "-N", "-Dartifact=" + artifact, "-Dtransitive=false",
-                               "-Dmaven.repo.local=" + state["m2"], stdin=subprocess.DEVNULL):
-                    log("WARNING: couldn't fetch " + artifact)
-            materialize(state, work, overlay)
-    except Exception as e:
-        if not isinstance(e, Rollback):
-            traceback.print_exc()
-            e = "helper failed (round %d)" % n
-        rollback(state, overlay)
-        log("WARNING: %s; removing the overlay - shaded libraries won't be reported" % e)
-        return 1
-    if not any(state["copies"].values()) and (state["binaries"] or not state["written"]):
-        if state["config"] is not False:
-            rollback(state, overlay)  # nothing could be reported: leave the project as it was
-            log("No bundled library could be reported; the hook's changes are undone")
-        return 0
-    if not state["problems"]:
-        edges = sum(len(p["children"]) for p in state["patches"].values())
-        log("Verified: all %d bundled dependencies resolve, each as its own copy under the library "
-            "that declares it (%d copies)" % (edges, sum(1 for done in state["copies"].values() if done)))
-
-    # the scanner fingerprints jars only in the real local repo
-    try:
-        promote(state, overlay)
-    except Exception:
-        traceback.print_exc()
-        log("WARNING: couldn't copy downloads into the local repo; they'll be reported without a SHA-1")
-
-    # best effort: without these files, reachability stays as it was; the tree stays either way
-    if REACHABILITY and any(state["copies"].values()):
-        try:
-            write_reachability_imports(state, work, overlay)
-        except Exception as e:
-            traceback.print_exc()
-            for folder in state["mirrors"]:
-                shutil.rmtree(folder, ignore_errors=True)
-            log("WARNING: couldn't write the reachability imports (%s: %s); Mend's reachability of the bundled "
-                "libraries stays as without them" % (e.__class__.__name__, e))
-
-    # final hierarchy: the last round's tree, the agent's own (promote only
-    # adds files behind the overlay, so it can't change it)
-    log("Dependency tree:")
-    for line in tree_lines(os.path.join(work, "resolved.txt")):
-        log("  " + line)
-    return 0
+    return Scan(work, overlay).run()
 
 
 if __name__ == "__main__":
