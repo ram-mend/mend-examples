@@ -4,15 +4,14 @@
 
 A shaded jar's published POM doesn't list the libraries it bundles. The Maven scan therefore sees the jar as a leaf, and doesn't report the bundled libraries or their vulnerabilities. 
 
-For example at [pom.xml](./sample-maven-projects/regular/pom.xml), `org.apache.parquet:parquet-jackson` 1.18.0 bundles three Jackson libraries, and `jackson-core` in turn bundles FastDoubleParser. With the hook, Mend reports them under the library that bundles them:
+For example, in [pom.xml](./sample-maven-projects/regular/pom.xml), `org.apache.parquet:parquet-jackson` 1.18.0 bundles three Jackson libraries, and every `jackson-core`, the project's own 2.22.3 included, bundles FastDoubleParser. With the hook, Mend reports each one under the library that bundles it:
 
-```
-parquet-jackson 1.18.0
-├─ jackson-core 2.22.1 ── fastdoubleparser 2.0.1
-├─ jackson-annotations 2.22
-└─ jackson-databind 2.22.1 ─┬─ jackson-annotations 2.22
-                            └─ jackson-core 2.22.1 ── fastdoubleparser 2.0.1
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./images/dependency-tree-dark.svg">
+  <img alt="Without the hook, demo-app has xstream 1.4.5 (with xmlpull 1.1.3.1 and xpp3_min 1.1.4c), jackson-core 2.22.3 and parquet-jackson 1.18.0, and parquet-jackson is a leaf. With the hook, the copies it declares are added: fastdoubleparser 2.0.1 under jackson-core 2.22.3; and under parquet-jackson, jackson-core 2.22.1 (with fastdoubleparser 2.0.1), jackson-annotations 2.22 and jackson-databind 2.22.1, which has jackson-annotations 2.22 and jackson-core 2.22.1 (with fastdoubleparser 2.0.1)." src="./images/dependency-tree-light.svg">
+</picture>
+
+A library bundled in two places appears under each parent: that's 8 copies here.
 
 Tested with Mend for GitHub Enterprise (self-hosted) 26.9.1.4.
 

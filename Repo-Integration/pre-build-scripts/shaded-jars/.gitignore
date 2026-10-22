@@ -6,6 +6,8 @@
 
 # 3. Explicitly include the hook, its README and the sample projects
 !README.md
+!images/
+!images/*.svg
 !shaded_deps_hierarchy.py
 !sample-maven-projects/
 !sample-maven-projects/*/
