@@ -162,6 +162,7 @@ The hook runs for every scan in the organization. It exits immediately for a rep
 | `/usr/bin/env: 'python3\r': No such file or directory` | The file has Windows line endings. Convert it to LF. |
 | `/usr/bin/env: 'python3': No such file or directory` | The scanner image has no Python 3. |
 | `WARNING: …; removing the overlay - shaded libraries won't be reported` | The hook rolled back. The lines above it show the Maven or Python error; set `MVN_LOG_LEVEL="-X"` for more detail. |
+| `WARNING: … isn't readable XML, even as Maven reads it …` | That POM (a published POM, a parent POM, or the `pom.xml` inside a jar) is damaged, so the hook goes on as if it weren't there, and what it would have read from it is missing. For example, a library whose published POM it is has its bundled dependencies unreported. A POM that only Maven reads, such as `hadoop-project` 3.1.0 with its `<Xlint:-unchecked/>`, is read the way Maven reads it, without a warning. |
 | `WARNING: couldn't fetch …` | The scanner can't download that published jar from your Maven repositories, so that library isn't reported. |
 | `nested deeper than MAX_ROUNDS` | Shading is nested deeper than the round limit. Increase `MAX_ROUNDS`. |
 | `WARNING: couldn't write the reachability imports …` | The hook couldn't read a source file or write the file next to it (that file is skipped), or failed otherwise (then none are written). The reported dependencies are unaffected; reachability is as without the hook. The lines above it show the error. |

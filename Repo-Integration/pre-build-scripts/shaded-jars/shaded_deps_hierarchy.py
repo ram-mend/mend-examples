@@ -16,8 +16,9 @@ REACHABILITY = True          # write the app's imports of relocated (shaded) cla
 HARD_LINKS = True            # copies of published jars in the local Maven repo: hard links to the jar (no extra disk space); False = full copies
 REPORT_EXCLUDED = False      # a bundled library an <exclusion> on its path removes: False = not reported, as Maven leaves it out; True = reported anyway
 
-import collections, filecmp, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
+import collections, filecmp, html.entities, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 
 NS = "http://maven.apache.org/POM/4.0.0"
 ET.register_namespace("", NS)
@@ -39,6 +40,7 @@ JAVA_IMPORT = re.compile(r"(?:^|(?<=;))\s*import\s+(static\s+)?([\w$.]+(?:\.\*)?
 JAVA_TYPE = re.compile(r"(?<![\w$.])(?:class|interface|enum|record|@\s*interface)\s+[\w$]")  # where the header ends
 COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 NOT_CLASSES = {"package-info.class", "module-info.class"}
+UNREADABLE = set()  # the POMs parse_pom couldn't read, each warned about once
 COMPANION = ("// Written by the shaded-jars pre-build hook for this scan, for Mend's reachability analysis:\n"
              "// the imports of relocated (shaded) classes in %s, under their original names.\n%s%s")
 
@@ -103,12 +105,43 @@ def is_runtime(dep, ns, scope=""):
     return (get("scope") or scope) in ("", "compile", "runtime") and get("optional") != "true"
 
 
-class Pom:
-    """A POM plus the properties, and the managed versions and scopes, of its parent chain."""
+def parse_pom(data, name):
+    """The root element of a POM's bytes. Maven's reader ignores XML namespaces
+    and knows HTML's named entities, so a POM Maven builds with can hold what
+    xml.etree rejects, such as <Xlint:-unchecked/> (hadoop-project 3.0-3.3.0)
+    or &oslash;. Such a POM is read again as Maven reads it: without namespaces.
+    None if even that fails: the caller goes on as if the file weren't there.
+    name: the file in the warning."""
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError:
+        pass
+    builder, parser = ET.TreeBuilder(), expat.ParserCreate()  # no namespace separator: a prefix is part of the name
+    parser.buffer_text = True
+    parser.StartElementHandler, parser.EndElementHandler = builder.start, builder.end
+    parser.CharacterDataHandler = builder.data
+    parser.UseForeignDTD(True)  # an undeclared entity is then skipped, not an error
+    parser.SkippedEntityHandler = lambda entity, _: builder.data(chr(html.entities.name2codepoint.get(entity, 0xFFFD)))
+    try:
+        parser.Parse(data, True)
+        return builder.close()
+    except expat.ExpatError as e:
+        if name not in UNREADABLE:
+            UNREADABLE.add(name)
+            log("WARNING: %s isn't readable XML, even as Maven reads it (%s); the hook goes on as if that file "
+                "weren't there" % (name, e))
+        return None
 
-    def __init__(self, data, g, v, repos):
-        self.root = ET.fromstring(data)
+
+class Pom:
+    """A POM plus the properties, and the managed versions and scopes, of its
+    parent chain. name: the POM in a warning (parse_pom)."""
+
+    def __init__(self, data, g, v, repos, name):
+        self.root = parse_pom(data, name)
         self.props, self.managed = {}, {}
+        if self.root is None:
+            return
         chain, node = [self.root], self.root
         for _ in range(10):
             parent = node.find(ns_of(node) + "parent")
@@ -120,7 +153,10 @@ class Pom:
             path = next((p for p in (repo_path(r, pg, pa, pv) for r in repos) if os.path.exists(p)), None)
             if path is None:
                 break
-            node = ET.parse(path).getroot()
+            with open(path, "rb") as f:
+                node = parse_pom(f.read(), path)
+            if node is None:
+                break  # as a parent that isn't in the repos
             chain.append(node)
         for node in reversed(chain):  # child overrides parent
             for p in node.findall(ns_of(node) + "properties/*"):
@@ -149,7 +185,10 @@ class Pom:
         return ":".join((get("groupId"), get("artifactId"), get("type", "jar"), get("classifier")))
 
     def runtime_deps(self):
-        """{g:a: version} of the dependencies passed on to consumers, in POM order."""
+        """{g:a: version} of the dependencies passed on to consumers, in POM
+        order; None if the POM can't be read."""
+        if self.root is None:
+            return None
         ns = ns_of(self.root)
         found = {}
         for d in self.root.findall("%sdependencies/%sdependency" % (ns, ns)):
@@ -188,11 +227,15 @@ def analyze(jar, g, a, v, pom_path, repos, name=None):
         own_pom = "META-INF/maven/%s/%s/pom.xml" % (g, a)
         if own_pom in names:
             raw = z.read(own_pom)
-            declared = Pom(raw, g, v, repos).runtime_deps()
+            declared = Pom(raw, g, v, repos, "%s!/%s" % (name, own_pom)).runtime_deps()
+            if declared is None:  # unreadable: as a jar without one
+                raw, declared = b"", {}
             own_deps = list(declared)
             if b"maven-shade-plugin" in raw and pom_path:
                 with open(pom_path, "rb") as f:
-                    kept = Pom(f.read(), g, v, repos).runtime_deps()
+                    kept = Pom(f.read(), g, v, repos, pom_path).runtime_deps()
+                if kept is None:  # unreadable: as without a published POM, only pom.properties count
+                    declared = {}
                 for ga, ver in sorted(declared.items()):
                     if ga in kept or ga in bundled or ga == own:
                         continue
@@ -209,8 +252,9 @@ def analyze(jar, g, a, v, pom_path, repos, name=None):
         for ga, ver in bundled.items():
             lg, la = ga.split(":")
             embedded = "META-INF/maven/%s/%s/pom.xml" % (lg, la)
-            deps = Pom(z.read(embedded), lg, ver, repos).runtime_deps() if embedded in names else {}
-            graph[ga] = [d for d in deps if "${" not in d]
+            deps = (Pom(z.read(embedded), lg, ver, repos, "%s!/%s" % (name, embedded)).runtime_deps()
+                    if embedded in names else {})
+            graph[ga] = [d for d in deps or {} if "${" not in d]
         if not bundled:
             classes = [n for n in names if n.endswith(".class") and not n.startswith("META-INF/")]
             counts = collections.Counter(m.group(1) for m in map(RELOCATED.match, classes) if m)
@@ -339,8 +383,8 @@ def own_packaging(path, g, a):
         entry = "META-INF/maven/%s/%s/pom.xml" % (g, a)
         if entry not in z.namelist():
             return ""
-        root = ET.fromstring(z.read(entry))
-    return (root.findtext(ns_of(root) + "packaging") or "").strip()
+        root = parse_pom(z.read(entry), "%s!/%s" % (os.path.basename(path), entry))
+    return "" if root is None else (root.findtext(ns_of(root) + "packaging") or "").strip()
 
 
 def class_packages(jar):
@@ -826,12 +870,15 @@ class Scan:
         g, a, ver = owner.split(":")
         patch = self.patches[owner]
         orig = self.original_pom(*patch["real"].split(":"))
-        if orig is None:
+        root = None
+        if orig is not None:
+            with open(orig, "rb") as f:
+                root = parse_pom(f.read(), orig)
+        if root is None:  # missing, or unreadable even as Maven reads it
             if patch["children"]:
                 self.warn_once("WARNING: couldn't get the published POM of %s; its bundled dependencies are not "
                                "reported" % owner)
             return
-        root = ET.parse(orig).getroot()
         ns = ns_of(root)
         deps = root.find(ns + "dependencies")
         removed = 0
