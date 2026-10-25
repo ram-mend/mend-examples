@@ -16,7 +16,7 @@ REACHABILITY = True          # write the app's imports of relocated (shaded) cla
 HARD_LINKS = True            # copies of published jars in the local Maven repo: hard links to the jar (no extra disk space); False = full copies
 REPORT_EXCLUDED = False      # a bundled library an <exclusion> on its path removes: False = not reported, as Maven leaves it out; True = reported anyway
 
-import collections, filecmp, html.entities, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
+import collections, filecmp, hashlib, html.entities, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
@@ -25,6 +25,7 @@ ET.register_namespace("", NS)
 ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 RELOCATED = re.compile(r"^((?:.*/)?(?:shaded|repackaged|relocated)/[^/]+)/")
 CLASSIFIER_PREFIX = "shaded-"
+MAX_NAME = 243  # bytes in a copy's file name: the filesystem's 255, less the ".lastUpdated" Maven may add to it
 OWN_VERSION = "%s-own%d"  # g:a:v of a copy's POM at a version of its own, the published one being the first
 SHADED_GROUP = "%s.shaded-copy"  # a copy's groupId once an exclusion on its path drops it (it matches g:a only)
 DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.6.0"
@@ -91,6 +92,16 @@ def classifier_for(patch):
     name spells its path to the project's dependency."""
     g, a, v = patch["real"].split(":")
     return CLASSIFIER_PREFIX + a + "-" + v + ("-" + patch["cls"] if patch["cls"] else "")
+
+
+def copy_classifier(a, version, cls):
+    """The classifier a copy of artifactId A at VERSION is named and declared
+    with: CLS (classifier_for, its whole path), or, if the file name would be
+    longer than MAX_NAME, the first 8 hex digits of CLS's SHA-1 (materialize
+    logs the path). CLS stays the copy's identity in the plan."""
+    if len(("%s-%s-%s.jar" % (a, version, cls)).encode()) <= MAX_NAME:
+        return cls
+    return CLASSIFIER_PREFIX + hashlib.sha1(cls.encode()).hexdigest()[:8]
 
 
 def coords(s):
@@ -667,8 +678,8 @@ class Scan:
             level = {}
             for owner, ga in self.tree_order(declared):
                 patch, child = self.patches[owner], self.patches[owner]["children"][ga]
-                real = ga + ":" + child["v"]
-                name = os.path.basename(repo_path("", *ga.split(":"), child["as"], "jar", classifier_for(patch)))
+                real, cls = ga + ":" + child["v"], copy_classifier(ga.split(":")[1], child["as"], classifier_for(patch))
+                name = os.path.basename(repo_path("", *ga.split(":"), child["as"], "jar", cls))
                 level[(real, real, self.find_jar(ga, child["v"]), name)] = (owner, ga)
 
     def look_inside(self, key, real, jar, name):
@@ -779,7 +790,7 @@ class Scan:
         return None  # no round left to check them
 
     def copies(self):
-        """[(g:a, published version, classifier, declared version)] of every copy planned."""
+        """[(g:a, published version, classifier (its whole path), declared version)] of every copy planned."""
         return [(ga, child["v"], classifier_for(patch), child["as"])
                 for patch in self.patches.values() for ga, child in patch["children"].items()]
 
@@ -791,7 +802,8 @@ class Scan:
     def unwrite(self, ga, cls, child):
         """Remove the copy's jar from the overlay, and its POM if it has children:
         nothing declares them at these coordinates any more."""
-        jar = repo_path(self.overlay, self.group_of(ga, cls), ga.split(":")[1], child["as"], "jar", cls)
+        g, a = self.group_of(ga, cls), ga.split(":")[1]
+        jar = repo_path(self.overlay, g, a, child["as"], "jar", copy_classifier(a, child["as"], cls))
         if os.path.exists(jar):
             os.remove(jar)
         pom = child["node"] and repo_path(self.overlay, *child["node"].split(":"))
@@ -808,7 +820,7 @@ class Scan:
         self.moved.add((ga, cls))
         g, a = ga.split(":")
         log("%s:%s:%s doesn't resolve under %s: an exclusion on its path removes it. Its copy is declared under "
-            "groupId %s instead" % (ga, child["as"], cls, owner, SHADED_GROUP % g))
+            "groupId %s instead" % (ga, child["as"], copy_classifier(a, child["as"], cls), owner, SHADED_GROUP % g))
         if child["node"]:
             node = "%s:%s:%s" % (SHADED_GROUP % g, a, child["as"])
             self.patches[node] = self.patches.pop(child["node"])
@@ -850,11 +862,14 @@ class Scan:
         """Write the copies not written yet, then every patched POM, into the overlay."""
         for ga, v, cls, ver in self.copies():
             g, a = self.group_of(ga, cls), ga.split(":")[1]
-            copy = repo_path(self.overlay, g, a, ver, "jar", cls)
+            name = copy_classifier(a, ver, cls)
+            copy = repo_path(self.overlay, g, a, ver, "jar", name)
             if not os.path.exists(copy):
                 os.makedirs(os.path.dirname(copy), exist_ok=True)
                 link_or_copy(self.find_jar(ga, v), copy)
-                log("Copy: %s:%s:%s:%s (byte-identical to the published %s jar)" % (g, a, ver, cls, v))
+                short = "" if name == cls else "; %s stands for its whole path, too long for a file name: %s" % (
+                    name[len(CLASSIFIER_PREFIX):], cls)
+                log("Copy: %s:%s:%s:%s (byte-identical to the published %s jar)%s" % (g, a, ver, name, v, short))
             pom = repo_path(self.overlay, g, a, ver)  # a moved copy without children: a POM with nothing in it
             if (ga, cls) in self.moved and "%s:%s:%s" % (g, a, ver) not in self.patches and not os.path.exists(pom):
                 with open(pom, "w") as f:
@@ -896,7 +911,8 @@ class Scan:
         for ga, child in patch["children"].items():
             dep = ET.SubElement(deps, ns + "dependency")
             cg, ca = self.group_of(ga, cls), ga.split(":")[1]
-            for tag, val in (("groupId", cg), ("artifactId", ca), ("version", child["as"]), ("classifier", cls)):
+            for tag, val in (("groupId", cg), ("artifactId", ca), ("version", child["as"]),
+                             ("classifier", copy_classifier(ca, child["as"], cls))):
                 ET.SubElement(dep, ns + tag).text = val
             excls = ET.SubElement(dep, ns + "exclusions")
             for x in sorted(self.exclusions) if child["node"] else ["*:*"]:
@@ -918,7 +934,8 @@ class Scan:
         self.written.add(out)
         log("Patched POM: %s declares %s%s%s" % (
             os.path.relpath(out, self.overlay),
-            ", ".join("%s:%s:%s:%s" % (self.group_of(ga, cls), ga.split(":")[1], c["as"], cls)
+            ", ".join("%s:%s:%s:%s" % (self.group_of(ga, cls), ga.split(":")[1], c["as"],
+                                       copy_classifier(ga.split(":")[1], c["as"], cls))
                       for ga, c in patch["children"].items()) or "nothing",
             "; removed its %d runtime dependencies" % removed if removed else "",
             " (the published %s POM, at this copy's own version)" % patch["real"] if own_version else ""))
@@ -933,8 +950,9 @@ class Scan:
         def edges(nodes):
             return {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in nodes if p}
 
-        def edge(owner, ga, child, cls):
-            return owner, self.group_of(ga, cls) + ":" + ga.split(":")[1], child["as"], cls
+        def edge(owner, ga, child, cls):  # as Maven's tree shows it: the copy's file-name classifier
+            a = ga.split(":")[1]
+            return owner, self.group_of(ga, cls) + ":" + a, child["as"], copy_classifier(a, child["as"], cls)
         under, shown = edges(tree), edges(tree if listed is None else listed)
         resolved = collections.defaultdict(set)  # g:a:v -> the classifiers it resolved with
         for (g, a, cls, v), _ in tree:
@@ -943,7 +961,8 @@ class Scan:
         for owner, patch in self.patches.items():
             cls = classifier_for(patch)
             # its parent resolved: a copy's node with the copy's classifier, a project artifact as any
-            here = patch["cls"] in resolved[owner] if patch["cls"] else resolved[owner]
+            _, a, v = owner.split(":")
+            here = copy_classifier(a, v, patch["cls"]) in resolved[owner] if patch["cls"] else resolved[owner]
             excluded += [(owner, ga) for ga, child in patch["children"].items()
                          if here and (ga, cls) not in self.moved and edge(owner, ga, child, cls) not in shown]
         moving = REPORT_EXCLUDED and not last and excluded
@@ -955,7 +974,7 @@ class Scan:
             patch = self.patches[owner]
             child = patch["children"][ga]
             log("Not reported: %s:%s:%s under %s: an exclusion on its path removes it%s (REPORT_EXCLUDED = True "
-                "reports it)" % (ga, child["as"], classifier_for(patch), owner,
+                "reports it)" % (ga, child["as"], edge(owner, ga, child, classifier_for(patch))[3], owner,
                                  ", with what's under it" if child["node"] else ""))
             self.leave_out(owner, ga)
         problems = 0
@@ -966,7 +985,7 @@ class Scan:
                     problems += 1
                     if not moving:  # else the next round checks them again
                         self.warn_once("WARNING: %s declares %s:%s:%s but Maven doesn't resolve it there"
-                                       % (owner, edge(owner, ga, child, cls)[1], child["as"], cls))
+                                       % ((owner,) + edge(owner, ga, child, cls)[1:]))
         strays = {}  # g:a -> the copy it resolved under
         for (g, a, cls, v), p in tree:
             owner = p and "%s:%s:%s" % (p[0], p[1], p[3])
@@ -975,7 +994,7 @@ class Scan:
                 continue  # a module, or one of the project's artifacts: its own dependencies are real
             child = next((c for ga, c in patch["children"].items()
                           if self.group_of(ga, classifier_for(patch)) + ":" + ga.split(":")[1] == g + ":" + a), None)
-            if not child or (cls, v) != (classifier_for(patch), child["as"]):
+            if not child or (cls, v) != (copy_classifier(a, child["as"], classifier_for(patch)), child["as"]):
                 strays.setdefault(g + ":" + a, owner)
         extras = sorted(set(strays) - self.bundled_all - self.exclusions)
         for ga in sorted(set(strays) - set(extras)):
@@ -993,7 +1012,8 @@ class Scan:
         overwriting and never a POM the hook wrote. With HARD_LINKS a copy is a
         hard link to its published jar (Maven only renames jars into place);
         nothing else is, as Maven rewrites some files in place."""
-        twins = {repo_path(self.overlay, self.group_of(ga, cls), ga.split(":")[1], ver, "jar", cls):
+        twins = {repo_path(self.overlay, self.group_of(ga, cls), ga.split(":")[1], ver, "jar",
+                           copy_classifier(ga.split(":")[1], ver, cls)):
                  repo_path(self.m2, *ga.split(":"), v, "jar")
                  for ga, v, cls, ver in self.copies()}  # overlay copy -> its published jar in the real repo
         srcs = sorted(os.path.join(dirpath, name) for dirpath, _, files in os.walk(self.overlay) for name in files
