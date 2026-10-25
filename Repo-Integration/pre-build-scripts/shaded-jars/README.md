@@ -24,7 +24,8 @@ The scanner runs the hook in the cloned repository before each scan. For each re
    - the jar's own `pom.xml`, when it configures `maven-shade-plugin`.
 2. **Declares each one under its parent.** Each bundled library is declared under the library that declares it, through a byte-identical copy of its published jar. The copy's classifier names that parent and every library above it, so its file name spells its whole path, for example `fastdoubleparser-2.0.1-shaded-jackson-core-2.22.1-shaded-jackson-databind-2.22.1-shaded-parquet-jackson-1.18.0.jar`. As a result:
    - a library bundled in several places appears under each parent;
-   - the project's own version of a library can't hide a bundled copy.
+   - the project's own version of a library can't hide a bundled copy;
+   - an `<exclusion>` is honored: a bundled library it matches isn't reported there, with what's under it, and the hook logs `Not reported: … an exclusion on its path removes it`. Its classes are still inside the jar that bundles it, though. To report it anyway, set `REPORT_EXCLUDED = True`: Maven matches an exclusion by groupId and artifactId only, so the hook then declares the copy again under groupId `<groupId>.shaded-copy`.
 3. **Verifies the tree.** Maven reads the patched POMs from a temporary repository under `.mvn/`, and the hook re-resolves until every copy is in place. It then logs `Verified`.
 
 Mend identifies each copy by its SHA-1 and reports it under its normal name and version. The project's `pom.xml` is never changed, and nothing is pushed to the repository.
@@ -90,6 +91,7 @@ Mend analyzes each module of a multi-module project with that module's own sourc
 | `BINARY_JARS` | `True`: in a repository without `pom.xml`, report what its jars bundle | `False` to leave repositories without a `pom.xml` alone. See "Repositories without pom.xml". |
 | `REACHABILITY` | `True`: write the app's imports of renamed (relocated) classes under their original names, for Mend's reachability analysis | `False` leaves the sources alone. See "Reachability". |
 | `HARD_LINKS` | `True`: each copy of a bundled library in the scanner's local Maven repository is a hard link to the published jar, taking no disk space of its own | `False` writes full copies instead, as earlier versions of the hook did. |
+| `REPORT_EXCLUDED` | `False`: a bundled library that an `<exclusion>` on its path matches isn't reported there, as Maven leaves it out | `True` reports it anyway, since its classes are still inside the jar that bundles it. See "How it works". |
 
 The hook runs for every scan in the organization. It exits immediately for a repository without a `pom.xml` at its root, unless the repository has no build at all and holds a jar that bundles libraries, and, when `REPOS` is set, for a repository it doesn't list.
 
@@ -140,6 +142,7 @@ The hook runs for every scan in the organization. It exits immediately for a rep
   - The `pom.xml` the hook writes takes its `<packaging>` from the jar's own `pom.xml` (Maven's default, `jar`, if it has none). A packaging that needs a Maven plugin, such as `bundle`, makes Maven fail; the hook then removes its changes and exits 1.
 - **Maven metadata needed.** Bundled libraries are found only through Maven metadata in the jar: the bundled library's `pom.properties`, or the jar's own `pom.xml` with a `maven-shade-plugin` configuration. Relocated code without metadata is only logged, as `contains relocated code with no Maven metadata`.
 - **Reported as the published library.** Bundled code is reported as the published library (matched by SHA-1), not as the relocated classes.
+- **Exclusions with `REPORT_EXCLUDED = True`.** A `*:*` exclusion matches every groupId, so the copies under that dependency stay hidden, with the warning `doesn't resolve it there`. When the exact bytes of a copy under `<groupId>.shaded-copy` are also published under another name, Mend may report it under that other name.
 - **Reachability.**
   - Only `import` lines count, as in Mend's analysis.
   - A renamed bundle *inside* a bundled library isn't followed, for example FastDoubleParser inside `jackson-core`. Mend's analysis doesn't follow it even without the hook.
