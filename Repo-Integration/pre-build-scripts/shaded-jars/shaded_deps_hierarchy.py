@@ -946,7 +946,9 @@ class Scan:
         an exclusion on its path removes (missing under a parent that resolved,
         and not in LISTED, TREE with the nodes Maven omitted) is left out, or with
         REPORT_EXCLUDED moved, unless this is the LAST round. A stray is
-        excluded, unless this is the LAST round or it's bundled somewhere."""
+        excluded, unless this is the LAST round. One bundled somewhere stays
+        and isn't a problem: excluding it would drop its bundled copies too, and
+        a library reported once too often beats one missing (the user's choice)."""
         def edges(nodes):
             return {(p[0] + ":" + p[1] + ":" + p[3], g + ":" + a, v, cls) for (g, a, cls, v), p in nodes if p}
 
@@ -997,7 +999,11 @@ class Scan:
             if not child or (cls, v) != (copy_classifier(a, child["as"], classifier_for(patch)), child["as"]):
                 strays.setdefault(g + ":" + a, owner)
         extras = sorted(set(strays) - self.bundled_all - self.exclusions)
-        for ga in sorted(set(strays) - set(extras)):
+        kept = sorted(set(strays) & self.bundled_all)
+        for ga in kept:
+            self.warn_once("Not excluded: %s resolves under %s, whose jar doesn't contain it (most likely through its "
+                           "parent POM); excluding it would also drop its bundled copies, so it stays" % (ga, strays[ga]))
+        for ga in sorted(set(strays) - set(extras) - set(kept)):  # excluded already, and still there
             self.warn_once("WARNING: %s resolves under %s, whose jar doesn't contain it, and can't be excluded there"
                            % (ga, strays[ga]))
         if extras:
@@ -1005,7 +1011,7 @@ class Scan:
                  "Excluding libraries the shaded jars don't contain: %s") % ", ".join(extras))
             if not last:
                 self.exclusions |= set(extras)
-        return problems + len(strays)
+        return problems + len(strays) - len(kept)
 
     def promote(self):
         """Copy the overlay's new files into the real local repo, never
