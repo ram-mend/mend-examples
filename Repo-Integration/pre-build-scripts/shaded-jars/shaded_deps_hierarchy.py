@@ -266,16 +266,53 @@ def analyze(jar, g, a, v, pom_path, repos, name=None):
             deps = (Pom(z.read(embedded), lg, ver, repos, "%s!/%s" % (name, embedded)).runtime_deps()
                     if embedded in names else {})
             graph[ga] = [d for d in deps or {} if "${" not in d]
-        if not bundled:
-            classes = [n for n in names if n.endswith(".class") and not n.startswith("META-INF/")]
-            counts = collections.Counter(m.group(1) for m in map(RELOCATED.match, classes) if m)
-            if counts:
-                licenses = sorted(os.path.basename(n) for n in names
-                                  if re.fullmatch(r"META-INF/[^/]+-LICENSE[^/]*", n))
-                log("WARNING: %s contains relocated code with no Maven metadata, not reported: %s%s"
-                    % (name, ", ".join("%s (%d classes)" % kv for kv in sorted(counts.items())),
-                       "; license files: " + ", ".join(licenses) if licenses else ""))
+        if not bundled:  # a jar that bundles libraries is checked once their jars are fetched (Scan.plan)
+            warn_unexplained(name, names, unexplained(jar, names, []))
     return bundled, graph, own_deps
+
+
+def unexplained(jar, names, bundled_jars):
+    """{folder: class count} of the relocated code in JAR (NAMES: its entries;
+    the folders RELOCATED matches) that none of BUNDLED_JARS explains: none of
+    their packages has all the class names of its package, whatever its size
+    (relocations() needs more, to tell where a package went). A class counts
+    under the highest folder that holds nothing explained, from its relocated
+    folder down to two below it (about where a library's packages start): with
+    nothing explained, RELOCATED's own folders."""
+    packages, above = set(), set()  # the folders of explained classes; those and every folder above them
+    if bundled_jars:
+        holders = collections.defaultdict(set)  # class file name -> the bundled packages that have one
+        for lib in bundled_jars:
+            for p, classes in class_packages(lib).items():
+                for c in classes:
+                    holders[c].add(p)
+        packages = {q for q, classes in class_packages(jar).items()
+                    if set.intersection(*(holders.get(c, set()) for c in classes))}
+        for folder in packages:
+            parts = folder.split("/")
+            above.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    counts = collections.Counter()
+    for n in names:
+        m = RELOCATED.match(n)
+        folder, _, name = n.rpartition("/")
+        if (not m or not name.endswith(".class") or name in NOT_CLASSES or n.startswith("META-INF/")
+                or folder in packages):
+            continue
+        top, rest = m.group(1), folder[len(m.group(1)):].split("/")[1:3]
+        while top in above and rest:
+            top += "/" + rest.pop(0)
+        counts[top] += 1
+    return counts
+
+
+def warn_unexplained(name, names, counts):
+    """Log what unexplained() found in the jar NAME (NAMES: its entries), with
+    the license files it ships, which can tell what that code is."""
+    if counts:
+        licenses = sorted(os.path.basename(n) for n in names if re.fullmatch(r"META-INF/[^/]+-LICENSE[^/]*", n))
+        log("WARNING: %s contains relocated code with no Maven metadata, not reported: %s%s"
+            % (name, ", ".join("%s (%d classes)" % kv for kv in sorted(counts.items())),
+               "; license files: " + ", ".join(licenses) if licenses else ""))
 
 
 def resolved_artifacts(path):
@@ -487,6 +524,7 @@ class Scan:
         self.patches = {}        # POM g:a:v -> {real, children: {g:a: {v, as, node}}, strip, cls}
         self.claimed = {}        # g:a:v -> the copy (classifier) using its published POM; "" = the project
         self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
+        self.unexplained = {}    # analysis key of a jar that bundles libraries -> unexplained() with their jars
         self.bundled_all = set()  # g:a of every library found bundled
         self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
         self.moved = set()       # (g:a, classifier) of the copies an exclusion dropped, declared under SHADED_GROUP
@@ -672,6 +710,8 @@ class Scan:
                 elif not self.original_pom(*ga.split(":"), v):
                     need.append("%s:%s:pom" % (ga, v))
             self.fetch(need)
+            for (key, _, jar, name), _ in bundling:
+                self.check_relocated(key, jar, name)
             declared = []
             for owner, key, name in owners:
                 declared += self.plan_bundle(owner, name, *self.analysis[key])
@@ -689,6 +729,17 @@ class Scan:
             self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name)
                                   if pom else ({}, {}, []))
         return self.analysis[key]
+
+    def check_relocated(self, key, jar, name):
+        """Warn about the relocated code in a jar that bundles libraries that none
+        of their published jars explains, such as a second version of one of
+        them, whose pom.properties had the same path. Once per analysis key."""
+        if key not in self.unexplained:
+            libs = [lib for lib in (self.find_jar(ga, v) for ga, v in sorted(self.analysis[key][0].items())) if lib]
+            with zipfile.ZipFile(jar) as z:
+                names = z.namelist()
+            self.unexplained[key] = unexplained(jar, names, libs)
+            warn_unexplained(name, names, self.unexplained[key])
 
     def owner_of(self, real, at):
         """The POM that declares what a jar bundles: a project artifact's own; for
