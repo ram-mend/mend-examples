@@ -271,23 +271,28 @@ def analyze(jar, g, a, v, pom_path, repos, name=None):
     return bundled, graph, own_deps
 
 
+def explained(jar, bundled_jars):
+    """The packages of JAR that BUNDLED_JARS explain: one package of theirs has
+    all its class names, whatever its size (relocations() needs more, to tell
+    where a package went)."""
+    holders = collections.defaultdict(set)  # class file name -> the bundled packages that have one
+    for lib in bundled_jars:
+        for p, classes in class_packages(lib).items():
+            for c in classes:
+                holders[c].add(p)
+    return {q for q, classes in class_packages(jar).items()
+            if set.intersection(*(holders.get(c, set()) for c in classes))}
+
+
 def unexplained(jar, names, bundled_jars):
     """{folder: class count} of the relocated code in JAR (NAMES: its entries;
-    the folders RELOCATED matches) that none of BUNDLED_JARS explains: none of
-    their packages has all the class names of its package, whatever its size
-    (relocations() needs more, to tell where a package went). A class counts
-    under the highest folder that holds nothing explained, from its relocated
-    folder down to two below it (about where a library's packages start): with
-    nothing explained, RELOCATED's own folders."""
+    the folders RELOCATED matches) that none of BUNDLED_JARS explains
+    (explained()). A class counts under the highest folder that holds nothing
+    explained, from its relocated folder down to two below it (about where a
+    library's packages start): with nothing explained, RELOCATED's own folders."""
     packages, above = set(), set()  # the folders of explained classes; those and every folder above them
     if bundled_jars:
-        holders = collections.defaultdict(set)  # class file name -> the bundled packages that have one
-        for lib in bundled_jars:
-            for p, classes in class_packages(lib).items():
-                for c in classes:
-                    holders[c].add(p)
-        packages = {q for q, classes in class_packages(jar).items()
-                    if set.intersection(*(holders.get(c, set()) for c in classes))}
+        packages = explained(jar, bundled_jars)
         for folder in packages:
             parts = folder.split("/")
             above.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
@@ -303,6 +308,46 @@ def unexplained(jar, names, bundled_jars):
             top += "/" + rest.pop(0)
         counts[top] += 1
     return counts
+
+
+def identify(jar, own, bundled_jars, candidates):
+    """([(g:a, v)], [[g:a:v, ...]]) of CANDIDATES ({(g:a, v): published jar}),
+    other than JAR's own g:a OWN, whose code is in JAR without Maven metadata:
+    each package of theirs is a folder there with exactly its class names, at
+    least one of them relocated code that BUNDLED_JARS don't explain
+    (unexplained()); so never another version with the class names of one
+    reported already. Candidates that match the same folder tie: nothing tells
+    which it is, so none of them is in the first list; each group is in the second."""
+    here = class_packages(jar)
+    folders_with = collections.defaultdict(list)  # a folder's class names -> the folders that have exactly them
+    for q, classes in here.items():
+        folders_with[frozenset(classes)].append(q)
+    flagged = {q for q in here if RELOCATED.match(q + "/")} - explained(jar, bundled_jars)
+    matches = {}  # (g:a, v) -> the folders its packages are
+    for (ga, v), path in sorted(candidates.items()):
+        if ga == own:
+            continue  # every package of its own is a folder there with exactly its class names
+        try:
+            packages = class_packages(path)
+        except (zipfile.BadZipFile, OSError):
+            continue
+        folders = set()
+        for p, classes in packages.items():
+            same = [q for q in folders_with.get(frozenset(classes), []) if q == p or q.endswith("/" + p)]
+            if not same:
+                break
+            folders.update(same)
+        else:
+            if folders & flagged:
+                matches[(ga, v)] = folders
+    found, ties = [], []
+    for c, folders in matches.items():
+        rivals = sorted(r for r, f in matches.items() if f & folders)
+        if len(rivals) == 1:
+            found.append(c)
+        elif rivals not in ties:
+            ties.append(rivals)
+    return found, [["%s:%s" % c for c in group] for group in ties]
 
 
 def warn_unexplained(name, names, counts):
@@ -398,6 +443,11 @@ PROJECT_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                '  <dependencies>\n%%s  </dependencies>\n</project>\n' % NS)
 DEPENDENCY = ("    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version>"
               "<classifier>%s</classifier></dependency>\n")
+# the libraries found so far, for the tree of what their POMs name (Scan.candidates)
+CANDIDATES_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n<project xmlns="%s">\n  <modelVersion>4.0.0</modelVersion>\n'
+                  '  <groupId>shaded-hook</groupId>\n  <artifactId>candidates</artifactId>\n  <version>0</version>\n'
+                  '  <packaging>pom</packaging>\n  <dependencies>\n%%s  </dependencies>\n</project>\n' % NS)
+CANDIDATES_DIR = os.path.join(".mvn", "shaded-hook-candidates")  # in the project: its .mvn/maven.config applies
 
 
 def find_binaries():
@@ -525,6 +575,7 @@ class Scan:
         self.claimed = {}        # g:a:v -> the copy (classifier) using its published POM; "" = the project
         self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
         self.unexplained = {}    # analysis key of a jar that bundles libraries -> unexplained() with their jars
+        self.identified = {}     # analysis key -> [(g:a, v)] it holds without Maven metadata, by its class files
         self.bundled_all = set()  # g:a of every library found bundled
         self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
         self.moved = set()       # (g:a, classifier) of the copies an exclusion dropped, declared under SHADED_GROUP
@@ -710,11 +761,11 @@ class Scan:
                 elif not self.original_pom(*ga.split(":"), v):
                     need.append("%s:%s:pom" % (ga, v))
             self.fetch(need)
-            for (key, _, jar, name), _ in bundling:
-                self.check_relocated(key, jar, name)
+            self.check_relocated([(key, jar, name) for (key, _, jar, name), _ in bundling])
             declared = []
             for owner, key, name in owners:
                 declared += self.plan_bundle(owner, name, *self.analysis[key])
+                declared += self.declare_identified(owner, key)
             level = {}
             for owner, ga in self.tree_order(declared):
                 patch, child = self.patches[owner], self.patches[owner]["children"][ga]
@@ -730,16 +781,82 @@ class Scan:
                                   if pom else ({}, {}, []))
         return self.analysis[key]
 
-    def check_relocated(self, key, jar, name):
-        """Warn about the relocated code in a jar that bundles libraries that none
-        of their published jars explains, such as a second version of one of
-        them, whose pom.properties had the same path. Once per analysis key."""
-        if key not in self.unexplained:
-            libs = [lib for lib in (self.find_jar(ga, v) for ga, v in sorted(self.analysis[key][0].items())) if lib]
-            with zipfile.ZipFile(jar) as z:
-                names = z.namelist()
-            self.unexplained[key] = unexplained(jar, names, libs)
+    def check_relocated(self, items):
+        """The relocated code in jars that bundle libraries (ITEMS: (analysis key,
+        jar, name)) that none of their published jars explains, such as a second
+        version of one of them, whose pom.properties had the same path. Libraries
+        the POMs of those found name, in any version Maven considers, whose class
+        files it is, are identified; the rest is warned about. Once per key."""
+        todo = []
+        for key, jar, name in items:
+            if key not in self.unexplained:
+                libs = [self.find_jar(ga, v) for ga, v in sorted(self.analysis[key][0].items())]
+                self.unexplained[key], self.identified[key] = {}, []
+                if None in libs:
+                    continue  # nothing tells that library's code apart; plan_bundle warns it couldn't be fetched
+                with zipfile.ZipFile(jar) as z:
+                    names = z.namelist()
+                self.unexplained[key] = unexplained(jar, names, libs)
+                todo.append((key, jar, name, names, libs))
+        candidates = self.candidates() if any(self.unexplained[key] for key, *_ in todo) else {}
+        for key, jar, name, names, libs in todo:
+            if candidates and self.unexplained[key]:
+                found, ties = identify(jar, ":".join(key.split(":")[:2]), libs, candidates)
+                for ga, v in found:
+                    log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
+                for group in ties:
+                    log("WARNING: %s holds one of %s, by its class files, which don't tell which; not reported"
+                        % (name, ", ".join(group)))
+                self.identified[key] = found
+                self.unexplained[key] = unexplained(jar, names, libs + [candidates[c] for c in found])
             warn_unexplained(name, names, self.unexplained[key])
+
+    def candidates(self):
+        """{(g:a, v): published jar} of the libraries that the POMs of those
+        found so far name, at any depth, in every version Maven considers (set
+        aside for a conflict too), fetched if missing. {} if Maven can't list them."""
+        found = {}
+        for bundled, _, _ in self.analysis.values():
+            for ga, v in bundled.items():
+                if self.original_pom(*ga.split(":"), v):  # Maven can't list a tree with a POM it can't get
+                    found.setdefault(ga, v)
+        pom, out = os.path.join(CANDIDATES_DIR, "pom.xml"), os.path.join(self.work, "candidates.txt")
+        made = not os.path.isdir(".mvn")
+        os.makedirs(CANDIDATES_DIR, exist_ok=True)
+        try:
+            with open(pom, "w") as f:
+                f.write(CANDIDATES_POM % "".join(
+                    "    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version></dependency>\n"
+                    % (*ga.split(":"), v) for ga, v in sorted(found.items())))
+            listed = mvn_run(DEP_PLUGIN + ":tree", "-f", pom, "-Dverbose", "-Dscope=runtime", "-DoutputType=text",
+                             "-DoutputFile=" + out, "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL)
+        finally:
+            shutil.rmtree(CANDIDATES_DIR, ignore_errors=True)
+            if made:
+                shutil.rmtree(".mvn", ignore_errors=True)  # the hook made it for this only
+        if not listed:
+            log("WARNING: couldn't list the dependencies of the libraries found; relocated code without Maven "
+                "metadata is only warned about")
+            return {}
+        named = sorted({(g + ":" + a, v) for (g, a, cls, v), parent in read_tree(out, omitted=True)
+                        if parent and not cls})
+        self.fetch(["%s:%s" % c for c in named if not self.find_jar(*c)], warn=False)
+        return {c: self.find_jar(*c) for c in named if self.find_jar(*c)}
+
+    def declare_identified(self, owner, key):
+        """Declare the libraries identified in a jar by their class files under
+        it (OWNER: its POM), whose POMs don't link them to the ones in it. Not one
+        it declares already, in another version. Returns the (POM, g:a) declared."""
+        found, children = [], self.patches[owner]["children"]
+        for ga, v in self.identified.get(key, []):
+            if ga in children:
+                self.warn_once("WARNING: %s also holds %s:%s, by its class files; the hook declares one version of a "
+                               "library under a library, so it isn't reported" % (owner, ga, v))
+                continue
+            children[ga] = {"v": v, "as": v, "node": None}
+            self.bundled_all.add(ga)
+            found.append((owner, ga))
+        return found
 
     def owner_of(self, real, at):
         """The POM that declares what a jar bundles: a project artifact's own; for
@@ -887,13 +1004,13 @@ class Scan:
                 self.leave_out(child["node"], sub)
             del self.patches[child["node"]]
 
-    def fetch(self, artifacts):
+    def fetch(self, artifacts, warn=True):
         """Fetch published jars (with their POM and parent POMs) and POMs into the
         real local repo, once each."""
         for artifact in sorted(set(artifacts) - self.fetched):
             self.fetched.add(artifact)
             if not mvn_run(DEP_PLUGIN + ":get", "-N", "-Dartifact=" + artifact, "-Dtransitive=false",
-                           "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL):
+                           "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL) and warn:
                 log("WARNING: couldn't fetch " + artifact)
 
     def find_jar(self, ga, v, cls=""):
