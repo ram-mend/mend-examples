@@ -360,6 +360,15 @@ def warn_unexplained(name, names, counts):
                "; license files: " + ", ".join(licenses) if licenses else ""))
 
 
+def candidates_pom(name, deps=(), modules=(), alone=False):
+    """CANDIDATES_POM named NAME, declaring DEPS ([(g:a, v)]; ALONE: each with
+    nothing under it), or aggregating MODULES (folders)."""
+    body = "".join(CANDIDATE % (*ga.split(":"), v, NOTHING_UNDER if alone else "") for ga, v in deps)
+    body = "  <dependencies>\n%s  </dependencies>\n" % body if deps else "  <modules>\n%s  </modules>\n" % "".join(
+        "    <module>%s</module>\n" % m for m in modules)
+    return (CANDIDATES_POM % (name, body)).encode()
+
+
 def resolved_artifacts(path):
     """[(g, a, classifier, v, file)] from dependency:list -DoutputAbsoluteArtifactFilename."""
     arts = []
@@ -443,10 +452,13 @@ PROJECT_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                '  <dependencies>\n%%s  </dependencies>\n</project>\n' % NS)
 DEPENDENCY = ("    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version>"
               "<classifier>%s</classifier></dependency>\n")
-# the libraries found so far, for the tree of what their POMs name (Scan.candidates)
+# a POM in CANDIDATES_DIR (artifactId, then its <dependencies> or <modules>): the libraries found so far, for the
+# tree of what their POMs name (Scan.candidates), or one of those that download the candidates' jars (Scan.download)
 CANDIDATES_POM = ('<?xml version="1.0" encoding="UTF-8"?>\n<project xmlns="%s">\n  <modelVersion>4.0.0</modelVersion>\n'
-                  '  <groupId>shaded-hook</groupId>\n  <artifactId>candidates</artifactId>\n  <version>0</version>\n'
-                  '  <packaging>pom</packaging>\n  <dependencies>\n%%s  </dependencies>\n</project>\n' % NS)
+                  '  <groupId>shaded-hook</groupId>\n  <artifactId>%%s</artifactId>\n  <version>0</version>\n'
+                  '  <packaging>pom</packaging>\n%%s</project>\n' % NS)
+CANDIDATE = "    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version>%s</dependency>\n"
+NOTHING_UNDER = "<exclusions><exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion></exclusions>"
 CANDIDATES_DIR = os.path.join(".mvn", "shaded-hook-candidates")  # in the project: its .mvn/maven.config applies
 
 
@@ -853,9 +865,7 @@ class Scan:
             for ga, v in bundled.items():
                 if self.original_pom(*ga.split(":"), v):  # Maven can't list a tree with a POM it can't get
                     found.setdefault(ga, v)
-        listed = self.list_candidates((CANDIDATES_POM % "".join(
-            "    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version></dependency>\n"
-            % (*ga.split(":"), v) for ga, v in sorted(found.items()))).encode())
+        listed = self.list_candidates(candidates_pom("candidates", sorted(found.items())))
         if listed is None:
             log("WARNING: couldn't list the dependencies of the libraries found; relocated code without Maven "
                 "metadata is only warned about")
@@ -864,32 +874,62 @@ class Scan:
     def list_candidates(self, pom, resolved=False):
         """{(g:a, v): published jar} of the libraries that POM (bytes) names, at
         any depth, in every version Maven considers (set aside for a conflict
-        too), fetched if missing; RESOLVED: only those Maven resolves, with their
-        jars, in one run. None if Maven can't list them. The POM goes in
-        CANDIDATES_DIR, inside the project, so its .mvn/maven.config applies."""
-        path, out = os.path.join(CANDIDATES_DIR, "pom.xml"), os.path.join(self.work, "candidates.txt")
-        made = not os.path.isdir(".mvn")
-        os.makedirs(CANDIDATES_DIR, exist_ok=True)
-        try:
-            with open(path, "wb") as f:
-                f.write(pom)
-            goal = [":list", "-DincludeScope=runtime", "-DoutputAbsoluteArtifactFilename=true"] if resolved else [
-                ":tree", "-Dverbose", "-Dscope=runtime", "-DoutputType=text"]
-            listed = mvn_run(DEP_PLUGIN + goal[0], "-f", path, *goal[1:], "-DoutputFile=" + out,
-                             "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL)
-        finally:
-            shutil.rmtree(CANDIDATES_DIR, ignore_errors=True)
-            if made:
-                shutil.rmtree(".mvn", ignore_errors=True)  # the hook made it for this only
-        if not listed:
+        too), their jars downloaded if missing; RESOLVED: only those Maven
+        resolves, with their jars, in one run. None if Maven can't list them."""
+        out = os.path.join(self.work, "candidates.txt")
+        goal = [":list", "-DincludeScope=runtime", "-DoutputAbsoluteArtifactFilename=true"] if resolved else [
+            ":tree", "-Dverbose", "-Dscope=runtime", "-DoutputType=text"]
+        if not self.run_in_candidates_dir({"pom.xml": pom}, DEP_PLUGIN + goal[0], *goal[1:], "-DoutputFile=" + out):
             return None
         if resolved:
             return {(g + ":" + a, v): f for g, a, cls, v, f in resolved_artifacts(out)
                     if not cls and f.endswith(".jar") and os.path.isfile(f)}
+        nodes = [TREE_LINE.match(line).group(2).lstrip("(") for line in tree_lines(out)]
+        poms = {coords(node) for node in nodes if node.split(":")[2] == "pom"}  # no jar there to compare
         named = sorted({(g + ":" + a, v) for (g, a, cls, v), parent in read_tree(out, omitted=True)
-                        if parent and not cls})
-        self.fetch(["%s:%s" % c for c in named if not self.find_jar(*c)], warn=False)
+                        if parent and not cls and (g, a, cls, v) not in poms})
+        self.download(named)
         return {c: self.find_jar(*c) for c in named if self.find_jar(*c)}
+
+    def download(self, artifacts):
+        """Fetch the published jars of ARTIFACTS ([(g:a, v)]) that are missing
+        and weren't tried yet, in one Maven run: a reactor of POMs in
+        CANDIDATES_DIR, each declaring a library at most once (one POM can't
+        hold two versions of it), with nothing under it. What's still missing
+        then (a missing jar fails its POM) goes through fetch, one run each."""
+        todo = [c for c in artifacts if not self.find_jar(*c) and "%s:%s" % c not in self.fetched]
+        if len(todo) > 1:  # for one jar, fetch's run is as quick
+            layers = []
+            for ga, v in todo:
+                layer = next((layer for layer in layers if ga not in layer), None)
+                if layer is None:
+                    layer = {}
+                    layers.append(layer)
+                layer[ga] = v
+            poms = {"pom.xml": candidates_pom("download", modules=[str(n) for n in range(len(layers))])}
+            for n, layer in enumerate(layers):
+                poms[os.path.join(str(n), "pom.xml")] = candidates_pom("download-%d" % n, sorted(layer.items()),
+                                                                       alone=True)
+            self.run_in_candidates_dir(poms, DEP_PLUGIN + ":list", "--fail-at-end",
+                                       "-DoutputFile=" + os.path.join(self.work, "downloaded.txt"))
+        self.fetch(["%s:%s" % c for c in todo if not self.find_jar(*c)], warn=False)
+
+    def run_in_candidates_dir(self, poms, goal, *args):
+        """mvn_run() of GOAL on CANDIDATES_DIR's pom.xml, with POMS ({path in
+        CANDIDATES_DIR: bytes}) written there, inside the project, so its
+        .mvn/maven.config applies; removed after, with .mvn if the hook made it."""
+        made = not os.path.isdir(".mvn")
+        try:
+            for path, data in poms.items():
+                os.makedirs(os.path.dirname(os.path.join(CANDIDATES_DIR, path)), exist_ok=True)
+                with open(os.path.join(CANDIDATES_DIR, path), "wb") as f:
+                    f.write(data)
+            return mvn_run(goal, "-f", os.path.join(CANDIDATES_DIR, "pom.xml"), *args, "-Dmaven.repo.local=" + self.m2,
+                           stdin=subprocess.DEVNULL)
+        finally:
+            shutil.rmtree(CANDIDATES_DIR, ignore_errors=True)
+            if made:
+                shutil.rmtree(".mvn", ignore_errors=True)  # the hook made it for this only
 
     def declare_identified(self, owner, key):
         """Declare the libraries identified in a jar by their class files under
