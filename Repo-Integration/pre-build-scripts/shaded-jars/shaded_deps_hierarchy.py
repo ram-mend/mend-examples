@@ -785,8 +785,11 @@ class Scan:
         """The relocated code in jars that bundle libraries (ITEMS: (analysis key,
         jar, name)) that none of their published jars explains, such as a second
         version of one of them, whose pom.properties had the same path. Libraries
-        the POMs of those found name, in any version Maven considers, whose class
-        files it is, are identified; the rest is warned about. Once per key."""
+        whose class files it is are identified: first those the jar's own pom.xml
+        names, at the versions it was built with; then, for what's left, those the
+        POMs of the libraries found name, in any version Maven considers (a
+        library nested in one of them isn't in the jar's own tree). The rest is
+        warned about. Once per key."""
         todo = []
         for key, jar, name in items:
             if key not in self.unexplained:
@@ -798,46 +801,91 @@ class Scan:
                     names = z.namelist()
                 self.unexplained[key] = unexplained(jar, names, libs)
                 todo.append((key, jar, name, names, libs))
-        candidates = self.candidates() if any(self.unexplained[key] for key, *_ in todo) else {}
+        shared = None  # candidates(), listed once
         for key, jar, name, names, libs in todo:
-            if candidates and self.unexplained[key]:
-                found, ties = identify(jar, ":".join(key.split(":")[:2]), libs, candidates)
-                for ga, v in found:
-                    log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
-                for group in ties:
+            found, ties, known = [], [], list(libs)
+            for own in (True, False):
+                if not self.unexplained[key]:
+                    break
+                if own:
+                    candidates = self.own_candidates(key, jar, name)
+                else:
+                    shared = self.candidates() if shared is None else shared
+                    candidates = shared
+                if candidates:
+                    more, tied = identify(jar, ":".join(key.split(":")[:2]), known, candidates)
+                    found += more
+                    ties += [group for group in tied if group not in ties]
+                    known += [candidates[c] for c in more]
+                    self.unexplained[key] = unexplained(jar, names, known)
+            for ga, v in found:
+                log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
+            for group in ties:
+                if not any("%s:%s" % c in group for c in found):  # else the second listing told which
                     log("WARNING: %s holds one of %s, by its class files, which don't tell which; not reported"
                         % (name, ", ".join(group)))
-                self.identified[key] = found
-                self.unexplained[key] = unexplained(jar, names, libs + [candidates[c] for c in found])
+            self.identified[key] = found
             warn_unexplained(name, names, self.unexplained[key])
 
+    def own_candidates(self, key, jar, name):
+        """list_candidates() of the jar's own embedded pom.xml: what the jar was
+        built from, at the versions Maven resolved for the build, which are the
+        ones shading takes, so one dependency:list gives them and their jars.
+        None if it has none, or Maven can't list it (a module list, a packaging
+        that needs a plugin, a jar it can't get...)."""
+        g, a = key.split(":")[:2]
+        with zipfile.ZipFile(jar) as z:
+            if "META-INF/maven/%s/%s/pom.xml" % (g, a) not in z.namelist():
+                return None
+            pom = z.read("META-INF/maven/%s/%s/pom.xml" % (g, a))
+        listed = self.list_candidates(pom, resolved=True)
+        if listed is None:
+            log("Maven can't list the dependencies of %s's own pom.xml; those the POMs of the libraries found name "
+                "are looked at instead" % name)
+        return listed
+
     def candidates(self):
-        """{(g:a, v): published jar} of the libraries that the POMs of those
-        found so far name, at any depth, in every version Maven considers (set
-        aside for a conflict too), fetched if missing. {} if Maven can't list them."""
+        """list_candidates() of the libraries found so far: those their POMs
+        name, at any depth, in every version Maven considers. {} if Maven can't
+        list them."""
         found = {}
         for bundled, _, _ in self.analysis.values():
             for ga, v in bundled.items():
                 if self.original_pom(*ga.split(":"), v):  # Maven can't list a tree with a POM it can't get
                     found.setdefault(ga, v)
-        pom, out = os.path.join(CANDIDATES_DIR, "pom.xml"), os.path.join(self.work, "candidates.txt")
+        listed = self.list_candidates((CANDIDATES_POM % "".join(
+            "    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version></dependency>\n"
+            % (*ga.split(":"), v) for ga, v in sorted(found.items()))).encode())
+        if listed is None:
+            log("WARNING: couldn't list the dependencies of the libraries found; relocated code without Maven "
+                "metadata is only warned about")
+        return listed or {}
+
+    def list_candidates(self, pom, resolved=False):
+        """{(g:a, v): published jar} of the libraries that POM (bytes) names, at
+        any depth, in every version Maven considers (set aside for a conflict
+        too), fetched if missing; RESOLVED: only those Maven resolves, with their
+        jars, in one run. None if Maven can't list them. The POM goes in
+        CANDIDATES_DIR, inside the project, so its .mvn/maven.config applies."""
+        path, out = os.path.join(CANDIDATES_DIR, "pom.xml"), os.path.join(self.work, "candidates.txt")
         made = not os.path.isdir(".mvn")
         os.makedirs(CANDIDATES_DIR, exist_ok=True)
         try:
-            with open(pom, "w") as f:
-                f.write(CANDIDATES_POM % "".join(
-                    "    <dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version></dependency>\n"
-                    % (*ga.split(":"), v) for ga, v in sorted(found.items())))
-            listed = mvn_run(DEP_PLUGIN + ":tree", "-f", pom, "-Dverbose", "-Dscope=runtime", "-DoutputType=text",
-                             "-DoutputFile=" + out, "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL)
+            with open(path, "wb") as f:
+                f.write(pom)
+            goal = [":list", "-DincludeScope=runtime", "-DoutputAbsoluteArtifactFilename=true"] if resolved else [
+                ":tree", "-Dverbose", "-Dscope=runtime", "-DoutputType=text"]
+            listed = mvn_run(DEP_PLUGIN + goal[0], "-f", path, *goal[1:], "-DoutputFile=" + out,
+                             "-Dmaven.repo.local=" + self.m2, stdin=subprocess.DEVNULL)
         finally:
             shutil.rmtree(CANDIDATES_DIR, ignore_errors=True)
             if made:
                 shutil.rmtree(".mvn", ignore_errors=True)  # the hook made it for this only
         if not listed:
-            log("WARNING: couldn't list the dependencies of the libraries found; relocated code without Maven "
-                "metadata is only warned about")
-            return {}
+            return None
+        if resolved:
+            return {(g + ":" + a, v): f for g, a, cls, v, f in resolved_artifacts(out)
+                    if not cls and f.endswith(".jar") and os.path.isfile(f)}
         named = sorted({(g + ":" + a, v) for (g, a, cls, v), parent in read_tree(out, omitted=True)
                         if parent and not cls})
         self.fetch(["%s:%s" % c for c in named if not self.find_jar(*c)], warn=False)
