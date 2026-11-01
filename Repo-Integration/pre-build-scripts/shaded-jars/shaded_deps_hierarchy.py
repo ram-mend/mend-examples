@@ -588,6 +588,7 @@ class Scan:
         self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
         self.unexplained = {}    # analysis key of a jar that bundles libraries -> unexplained() with their jars
         self.identified = {}     # analysis key -> [(g:a, v)] it holds without Maven metadata, by its class files
+        self.metadata = {}       # published jar -> {g:a: version} of the pom.properties in it (came_with)
         self.bundled_all = set()  # g:a of every library found bundled
         self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
         self.moved = set()       # (g:a, classifier) of the copies an exclusion dropped, declared under SHADED_GROUP
@@ -984,12 +985,19 @@ class Scan:
     def plan_bundle(self, jar_owner, jar_name, bundled, graph, own_deps):
         """Declare what one jar bundles, as a tree: what its own pom.xml declares
         and each library's own dependencies, among the libraries in the jar; the
-        jar declares the rest. A copy under each parent, none without a published
-        jar. Returns the (POM, g:a) declared."""
+        jar declares the rest, but not one whose metadata came in with another of
+        them (came_with): the next level finds it under that one. A copy under
+        each parent, none without a published jar. Returns the (POM, g:a) declared."""
         kids_of = {ga: [d for d in graph.get(ga, []) if d in bundled and d != ga] for ga in bundled}
         top = [ga for ga in own_deps if ga in bundled]
         declared = set(top) | {ga for kids in kids_of.values() for ga in kids}
-        top += sorted(ga for ga in bundled if ga not in declared)
+        loose = sorted(ga for ga in bundled if ga not in declared)
+        carriers = {ga: self.came_with(ga, bundled) for ga in loose}
+        came = {ga: c for ga, c in carriers.items() if c and not carriers.get(c)}  # its carrier stays here
+        for ga, c in sorted(came.items()):
+            log("In %s, %s:%s came in with %s:%s, whose jar has the same pom.properties; it is reported under that "
+                "library" % (jar_name, ga, bundled[ga], c, bundled[c]))
+        top += [ga for ga in loose if ga not in came]
         log("Edges in %s: %s" % (jar_name, "; ".join(
             "%s -> %s" % (owner.split(":")[1], ", ".join(k.split(":")[1] for k in kids))
             for owner, kids in [(jar_owner, top)] + list(kids_of.items()) if kids)))
@@ -1012,6 +1020,21 @@ class Scan:
                     declare(self.node_of(child, ga + ":" + child["v"], cls), sub, path | {ga})
         declare(jar_owner, top, {jar_owner.rsplit(":", 1)[0]})
         return found
+
+    def came_with(self, ga, bundled):
+        """The g:a of another library in BUNDLED ({g:a: version}, found in one
+        jar) whose published jar holds ga's pom.properties, at the same version:
+        ga's metadata came in with that library, which bundles ga itself. None
+        if no such library."""
+        for other, v in sorted(bundled.items()):
+            jar = self.find_jar(other, v) if other != ga else None
+            if jar and jar not in self.metadata:
+                with zipfile.ZipFile(jar) as z:
+                    self.metadata[jar] = {"%s:%s" % p[:2]: p[2] for p in (
+                        pom_properties(z, n) for n in z.namelist() if POM_PROPERTIES.fullmatch(n)) if all(p)}
+            if jar and self.metadata[jar].get(ga) == bundled[ga]:
+                return other
+        return None
 
     def tree_order(self, pairs):
         """PAIRS (POM, g:a) in tree order: the project's jars in list order, then
