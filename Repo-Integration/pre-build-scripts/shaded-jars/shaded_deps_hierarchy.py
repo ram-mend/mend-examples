@@ -350,6 +350,21 @@ def identify(jar, own, bundled_jars, candidates):
     return found, [["%s:%s" % c for c in group] for group in ties]
 
 
+def settle_tie(group, pom):
+    """(g:a, v) of the tie GROUP ([g:a:v, ...]) that POM, the Pom of the jar's
+    published POM, sets: the version it declares, or else manages, its parents'
+    included. The jar was built with that version, which its class files can't
+    tell: hadoop-project 3.3.4 sets Guava 27.0-jre for hadoop-client-runtime.
+    None if GROUP is more than one library, or POM is None or sets none of its
+    versions."""
+    libs = {c.rsplit(":", 1)[0] for c in group}
+    if pom is None or len(libs) != 1:
+        return None
+    ga = libs.pop()
+    v = (pom.runtime_deps() or {}).get(ga) or pom.managed.get(ga + ":jar:", ("",))[0]
+    return (ga, v) if "%s:%s" % (ga, v) in group else None
+
+
 def warn_unexplained(name, names, counts):
     """Log what unexplained() found in the jar NAME (NAMES: its entries), with
     the license files it ships, which can tell what that code is."""
@@ -801,8 +816,9 @@ class Scan:
         whose class files it is are identified: first those the jar's own pom.xml
         names, at the versions it was built with; then, for what's left, those the
         POMs of the libraries found name, in any version Maven considers (a
-        library nested in one of them isn't in the jar's own tree). The rest is
-        warned about. Once per key."""
+        library nested in one of them isn't in the jar's own tree). Versions
+        whose class files tie are settled by the jar's published POM
+        (settle_tie()). The rest is warned about. Once per key."""
         todo = []
         for key, jar, name in items:
             if key not in self.unexplained:
@@ -816,7 +832,7 @@ class Scan:
                 todo.append((key, jar, name, names, libs))
         shared = None  # candidates(), listed once
         for key, jar, name, names, libs in todo:
-            found, ties, known = [], [], list(libs)
+            found, ties, known, settled = [], [], list(libs), {}
             for own in (True, False):
                 if not self.unexplained[key]:
                     break
@@ -827,18 +843,37 @@ class Scan:
                     candidates = shared
                 if candidates:
                     more, tied = identify(jar, ":".join(key.split(":")[:2]), known, candidates)
+                    for group in tied:
+                        pick = settle_tie(group, self.published_pom(key))
+                        if pick:
+                            more.append(pick)
+                            settled[pick] = [c.rsplit(":", 1)[1] for c in group if c != "%s:%s" % pick]
+                        elif group not in ties:
+                            ties.append(group)
                     found += more
-                    ties += [group for group in tied if group not in ties]
                     known += [candidates[c] for c in more]
                     self.unexplained[key] = unexplained(jar, names, known)
             for ga, v in found:
-                log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
+                if (ga, v) in settled:
+                    log("Shaded in %s: %s:%s (by its class files, which %s match too; the jar's published POM sets %s)"
+                        % (name, ga, v, ", ".join(o + "'s" for o in settled[(ga, v)]), v))
+                else:
+                    log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
             for group in ties:
                 if not any("%s:%s" % c in group for c in found):  # else the second listing told which
                     log("WARNING: %s holds one of %s, by its class files, which don't tell which; not reported"
                         % (name, ", ".join(group)))
             self.identified[key] = found
             warn_unexplained(name, names, self.unexplained[key])
+
+    def published_pom(self, key):
+        """The Pom of the published POM of the jar of analysis KEY; None if missing."""
+        g, a, v = key.split(":")[:3]
+        path = self.original_pom(g, a, v)
+        if path is None:
+            return None
+        with open(path, "rb") as f:
+            return Pom(f.read(), g, v, [self.m2, self.overlay], path)
 
     def own_candidates(self, key, jar, name):
         """list_candidates() of the jar's own embedded pom.xml: what the jar was
