@@ -844,8 +844,8 @@ class Scan:
         """list_candidates() of the jar's own embedded pom.xml: what the jar was
         built from, at the versions Maven resolved for the build, which are the
         ones shading takes, so one dependency:list gives them and their jars.
-        None if it has none, or Maven can't list it (a module list, a packaging
-        that needs a plugin, a jar it can't get...)."""
+        None if it has none, or Maven can't list it (a packaging that needs a
+        plugin, a jar it can't get...)."""
         g, a = key.split(":")[:2]
         with zipfile.ZipFile(jar) as z:
             if "META-INF/maven/%s/%s/pom.xml" % (g, a) not in z.namelist():
@@ -876,11 +876,14 @@ class Scan:
         """{(g:a, v): published jar} of the libraries that POM (bytes) names, at
         any depth, in every version Maven considers (set aside for a conflict
         too), their jars downloaded if missing; RESOLVED: only those Maven
-        resolves, with their jars, in one run. None if Maven can't list them."""
+        resolves, with their jars, in one run. None if Maven can't list them.
+        Its modules aren't read (-N): a jar's own pom.xml can be its parent's
+        (kryo-shaded's is kryo-parent's), whose module files aren't there."""
         out = os.path.join(self.work, "candidates.txt")
         goal = [":list", "-DincludeScope=runtime", "-DoutputAbsoluteArtifactFilename=true"] if resolved else [
             ":tree", "-Dverbose", "-Dscope=runtime", "-DoutputType=text"]
-        if not self.run_in_candidates_dir({"pom.xml": pom}, DEP_PLUGIN + goal[0], *goal[1:], "-DoutputFile=" + out):
+        if not self.run_in_candidates_dir({"pom.xml": pom}, DEP_PLUGIN + goal[0], "-N", *goal[1:],
+                                          "-DoutputFile=" + out):
             return None
         if resolved:
             return {(g + ":" + a, v): f for g, a, cls, v, f in resolved_artifacts(out)
