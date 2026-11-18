@@ -32,6 +32,8 @@ DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.6.0"
 HELP_PLUGIN = "org.apache.maven.plugins:maven-help-plugin:3.5.1"  # binary mode: where the local repo is
 BINARY_PREFIX = CLASSIFIER_PREFIX + "binary-"  # + version: a jar in the repository, declared as a copy of itself
 POM_PROPERTIES = re.compile(r"META-INF/maven/[^/]+/[^/]+/pom\.properties")
+NOTICE = re.compile(r"META-INF/NOTICE[^/]*")
+NOTICE_LINE = re.compile(r"^[ \t]*-[ \t]+([\w.-]+):([\w.-]+):([\w.-]+)[ \t]*\r?$", re.M)  # - group:name:version
 BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.sbt"}
 CONFIG = os.path.join(".mvn", "maven.config")
 TREE_LINE = re.compile(r"((?:[| ]  )*[+\\]- |)(\(?[^\s:]+(?::\S+){3})")  # (prefix, g:a:type:...)
@@ -217,11 +219,13 @@ def pom_properties(z, entry):
     return tuple(props.get(k, "").strip() for k in ("groupId", "artifactId", "version"))
 
 
-def analyze(jar, g, a, v, pom_path, repos, name=None):
+def analyze(jar, g, a, v, pom_path, repos, name=None, listed=False):
     """({g:a: version} of the libraries a jar bundles, {g:a: [g:a it depends on]}
     among them from their embedded POMs, [g:a] the jar's own original pom.xml
     declares). pom_path: the published POM, or None (only pom.properties count).
-    name: the jar's name in the log."""
+    name: the jar's name in the log. listed: its NOTICE lists libraries
+    (notice_libraries()), which its relocated code is checked against later
+    (Scan.check_relocated), so it isn't warned about here."""
     name, own = name or os.path.basename(jar), g + ":" + a
     bundled, own_deps = {}, []
     with zipfile.ZipFile(jar) as z:
@@ -266,7 +270,7 @@ def analyze(jar, g, a, v, pom_path, repos, name=None):
             deps = (Pom(z.read(embedded), lg, ver, repos, "%s!/%s" % (name, embedded)).runtime_deps()
                     if embedded in names else {})
             graph[ga] = [d for d in deps or {} if "${" not in d]
-        if not bundled:  # a jar that bundles libraries is checked once their jars are fetched (Scan.plan)
+        if not bundled and not listed:  # else checked once the jars are fetched (Scan.check_relocated)
             warn_unexplained(name, names, unexplained(jar, names, []))
     return bundled, graph, own_deps
 
@@ -348,6 +352,51 @@ def identify(jar, own, bundled_jars, candidates):
         elif rivals not in ties:
             ties.append(rivals)
     return found, [["%s:%s" % c for c in group] for group in ties]
+
+
+def notice_libraries(jar):
+    """[(g:a, v)] that a jar's META-INF/NOTICE files list as bundled, one
+    "- group:name:version" line each, as Apache Flink's jars do. Not a
+    classifier's line (native code: no class files to check), nor a library
+    listed in two versions: class names don't tell them apart."""
+    versions = collections.defaultdict(set)
+    with zipfile.ZipFile(jar) as z:
+        for entry in z.namelist():
+            if NOTICE.fullmatch(entry):
+                for g, a, v in NOTICE_LINE.findall(z.read(entry).decode("utf-8", "replace")):
+                    versions[g + ":" + a].add(v)
+    return sorted((ga, vs.pop()) for ga, vs in versions.items() if len(vs) == 1)
+
+
+def identify_listed(jar, own, bundled_jars, candidates):
+    """[(g:a, v)] of CANDIDATES ({(g:a, v): published jar}), libraries JAR's
+    NOTICE lists (notice_libraries()), other than its own g:a OWN, whose code
+    is in JAR: every class file of theirs, in a folder named like its package,
+    at least one of them relocated code that BUNDLED_JARS don't explain. Unlike
+    identify(), the folder may hold more: two libraries can share a package
+    (netty-codec and netty-codec-xml in flink-shaded-netty), and the list,
+    from the build that made the jar, has one version per library, so none
+    competes for that code."""
+    here = class_packages(jar)
+    flagged = {q for q in here if RELOCATED.match(q + "/")} - explained(jar, bundled_jars)
+    found = []
+    for (ga, v), path in sorted(candidates.items()):
+        if ga == own:
+            continue  # every class file of its own is in the jar
+        try:
+            packages = class_packages(path)
+        except (zipfile.BadZipFile, OSError):
+            continue
+        folders = set()
+        for p, classes in packages.items():
+            holding = {q for q, there in here.items() if (q == p or q.endswith("/" + p)) and classes <= there}
+            if not holding:
+                break
+            folders |= holding
+        else:
+            if folders & flagged:
+                found.append((ga, v))
+    return found
 
 
 def settle_tie(group, pom):
@@ -601,8 +650,9 @@ class Scan:
         self.patches = {}        # POM g:a:v -> {real, children: {g:a: {v, as, node}}, strip, cls}
         self.claimed = {}        # g:a:v -> the copy (classifier) using its published POM; "" = the project
         self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
-        self.unexplained = {}    # analysis key of a jar that bundles libraries -> unexplained() with their jars
+        self.unexplained = {}    # key of a jar that bundles or lists libraries -> unexplained() with their jars
         self.identified = {}     # analysis key -> [(g:a, v)] it holds without Maven metadata, by its class files
+        self.listed = {}         # analysis key -> [(g:a, v)] its NOTICE lists, where check_relocated reads it
         self.metadata = {}       # published jar -> {g:a: version} of the pom.properties in it (came_with)
         self.bundled_all = set()  # g:a of every library found bundled
         self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
@@ -767,7 +817,8 @@ class Scan:
                 key = gav + ":" + cls if cls and gav not in self.binaries else gav  # not the published jar
                 level.setdefault((key, gav, jar, os.path.basename(jar)), None)
         for depth in range(1, MAX_ROUNDS + 1):
-            bundling = [(item, at) for item, at in level.items() if self.look_inside(*item)[0]]
+            bundling = [(item, at) for item, at in level.items()
+                        if self.look_inside(*item)[0] or item[0] in self.listed]
             if not bundling:
                 return
             if depth == MAX_ROUNDS:
@@ -792,7 +843,8 @@ class Scan:
             self.check_relocated([(key, jar, name) for (key, _, jar, name), _ in bundling])
             declared = []
             for owner, key, name in owners:
-                declared += self.plan_bundle(owner, name, *self.analysis[key])
+                if self.analysis[key][0]:  # else a jar that only lists libraries
+                    declared += self.plan_bundle(owner, name, *self.analysis[key])
                 declared += self.declare_identified(owner, key)
             level = {}
             for owner, ga in self.tree_order(declared):
@@ -802,23 +854,35 @@ class Scan:
                 level[(real, real, self.find_jar(ga, child["v"]), name)] = (owner, ga)
 
     def look_inside(self, key, real, jar, name):
-        """analyze() of a jar, once per key: copies are byte-identical to the published jar."""
+        """analyze() of a jar, once per key: copies are byte-identical to the
+        published jar. What its NOTICE lists goes in self.listed, for
+        check_relocated: for a jar that bundles no library with metadata, only
+        when it has relocated code, which plan() then has checked."""
         if key not in self.analysis:
             pom = self.original_pom(*real.split(":"))
-            self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name)
+            listed = notice_libraries(jar) if pom else []
+            self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name, bool(listed))
                                   if pom else ({}, {}, []))
+            if listed:
+                with zipfile.ZipFile(jar) as z:
+                    names = z.namelist()
+                if self.analysis[key][0] or unexplained(jar, names, []):
+                    self.listed[key] = listed
         return self.analysis[key]
 
     def check_relocated(self, items):
-        """The relocated code in jars that bundle libraries (ITEMS: (analysis key,
-        jar, name)) that none of their published jars explains, such as a second
-        version of one of them, whose pom.properties had the same path. Libraries
-        whose class files it is are identified: first those the jar's own pom.xml
-        names, at the versions it was built with; then, for what's left, those the
-        POMs of the libraries found name, in any version Maven considers (a
-        library nested in one of them isn't in the jar's own tree). Versions
-        whose class files tie are settled by the jar's published POM
-        (settle_tie()). The rest is warned about. Once per key."""
+        """The relocated code in jars that bundle libraries, or list them in a
+        NOTICE (ITEMS: (analysis key, jar, name)), that none of their published
+        jars explains, such as a second version of one of them, whose
+        pom.properties had the same path. Libraries whose class files it is are
+        identified: first those the jar's own pom.xml names, at the versions it
+        was built with; then those its NOTICE lists, whose class files are all
+        there (identify_listed()), their jars downloaded in one Maven run; then,
+        for what's left, those the POMs of the libraries found name, in any
+        version Maven considers (a library nested in one of them isn't in the
+        jar's own tree). A jar that bundles no library with metadata has only
+        its NOTICE's. Versions whose class files tie are settled by the jar's
+        published POM (settle_tie()). The rest is warned about. Once per key."""
         todo = []
         for key, jar, name in items:
             if key not in self.unexplained:
@@ -830,19 +894,26 @@ class Scan:
                     names = z.namelist()
                 self.unexplained[key] = unexplained(jar, names, libs)
                 todo.append((key, jar, name, names, libs))
+        self.download(sorted({c for key, *_ in todo if self.unexplained[key] for c in self.listed.get(key, [])}))
         shared = None  # candidates(), listed once
         for key, jar, name, names, libs in todo:
-            found, ties, known, settled = [], [], list(libs), {}
-            for own in (True, False):
+            found, ties, known, settled, noticed = [], [], list(libs), {}, set()
+            for source in ("own", "notice", "found") if libs else ("notice",):
                 if not self.unexplained[key]:
                     break
-                if own:
+                if source == "own":
                     candidates = self.own_candidates(key, jar, name)
+                elif source == "notice":
+                    candidates = {c: self.find_jar(*c) for c in self.listed.get(key, []) if self.find_jar(*c)}
                 else:
                     shared = self.candidates() if shared is None else shared
                     candidates = shared
                 if candidates:
-                    more, tied = identify(jar, ":".join(key.split(":")[:2]), known, candidates)
+                    if source == "notice":
+                        more, tied = identify_listed(jar, ":".join(key.split(":")[:2]), known, candidates), []
+                        noticed.update(more)
+                    else:
+                        more, tied = identify(jar, ":".join(key.split(":")[:2]), known, candidates)
                     for group in tied:
                         pick = settle_tie(group, self.published_pom(key))
                         if pick:
@@ -857,6 +928,8 @@ class Scan:
                 if (ga, v) in settled:
                     log("Shaded in %s: %s:%s (by its class files, which %s match too; the jar's published POM sets %s)"
                         % (name, ga, v, ", ".join(o + "'s" for o in settled[(ga, v)]), v))
+                elif (ga, v) in noticed:
+                    log("Shaded in %s: %s:%s (by its class files; the jar's NOTICE lists it)" % (name, ga, v))
                 else:
                     log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
             for group in ties:
