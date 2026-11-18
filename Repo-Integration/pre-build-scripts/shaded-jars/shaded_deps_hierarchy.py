@@ -15,6 +15,7 @@ BINARY_JARS = True           # in a repo without pom.xml, report what its jars b
 REACHABILITY = True          # write the app's imports of relocated (shaded) classes under their original names, for Mend's reachability analysis
 HARD_LINKS = True            # copies of published jars in the local Maven repo: hard links to the jar (no extra disk space); False = full copies
 REPORT_EXCLUDED = False      # a bundled library an <exclusion> on its path removes: False = not reported, as Maven leaves it out; True = reported anyway
+VERSION_FILES = {"META-INF/io.netty.versions.properties": "io.netty:netty-bom"}  # a version file a library leaves in jars -> its BOM; {} = off
 
 import collections, filecmp, hashlib, html.entities, os, re, shutil, subprocess, sys, tempfile, traceback, zipfile
 import xml.etree.ElementTree as ET
@@ -34,6 +35,7 @@ BINARY_PREFIX = CLASSIFIER_PREFIX + "binary-"  # + version: a jar in the reposit
 POM_PROPERTIES = re.compile(r"META-INF/maven/[^/]+/[^/]+/pom\.properties")
 NOTICE = re.compile(r"META-INF/NOTICE[^/]*")
 NOTICE_LINE = re.compile(r"^[ \t]*-[ \t]+([\w.-]+):([\w.-]+):([\w.-]+)[ \t]*\r?$", re.M)  # - group:name:version
+VERSION_LINE = re.compile(r"^[\w.-]+\.version=([\w.-]+)[ \t]*\r?$", re.M)  # <module>.version=<version>
 BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.sbt"}
 CONFIG = os.path.join(".mvn", "maven.config")
 TREE_LINE = re.compile(r"((?:[| ]  )*[+\\]- |)(\(?[^\s:]+(?::\S+){3})")  # (prefix, g:a:type:...)
@@ -368,9 +370,31 @@ def notice_libraries(jar):
     return sorted((ga, vs.pop()) for ga, vs in versions.items() if len(vs) == 1)
 
 
+def jar_list(jar):
+    """(the libraries a jar lists as bundled, or else (a file of VERSION_FILES
+    in it, the g:a:v of the BOM that lists them)): its NOTICE's
+    (notice_libraries()), or else its library's BOM at the version that file
+    names. A library writes such a file into each of its jars, one
+    "<module>.version=" line, and a jar that bundles several keeps one, so it
+    names the version, not the modules: Netty's io.netty.versions.properties,
+    4.1.79.Final in grpc-netty-shaded 1.53.0. No BOM for a file that names two
+    versions: class names don't tell which module is which."""
+    listed = notice_libraries(jar)
+    if listed:
+        return listed, None
+    with zipfile.ZipFile(jar) as z:
+        names = set(z.namelist())
+        for path, bom in sorted(VERSION_FILES.items()):
+            if path in names:
+                versions = set(VERSION_LINE.findall(z.read(path).decode("utf-8", "replace")))
+                if len(versions) == 1:
+                    return [], (path, "%s:%s" % (bom, versions.pop()))
+    return [], None
+
+
 def identify_listed(jar, own, bundled_jars, candidates):
-    """[(g:a, v)] of CANDIDATES ({(g:a, v): published jar}), libraries JAR's
-    NOTICE lists (notice_libraries()), other than its own g:a OWN, whose code
+    """[(g:a, v)] of CANDIDATES ({(g:a, v): published jar}), libraries JAR
+    lists (jar_list()), other than its own g:a OWN, whose code
     is in JAR: every class file of theirs, in a folder named like its package,
     at least one of them relocated code that BUNDLED_JARS don't explain. Unlike
     identify(), the folder may hold more: two libraries can share a package
@@ -652,7 +676,7 @@ class Scan:
         self.analysis = {}       # published g:a:v, + ":classifier" for a project jar with one -> analyze()
         self.unexplained = {}    # key of a jar that bundles or lists libraries -> unexplained() with their jars
         self.identified = {}     # analysis key -> [(g:a, v)] it holds without Maven metadata, by its class files
-        self.listed = {}         # analysis key -> [(g:a, v)] its NOTICE lists, where check_relocated reads it
+        self.listed = {}         # analysis key -> jar_list() of it, where check_relocated reads it
         self.metadata = {}       # published jar -> {g:a: version} of the pom.properties in it (came_with)
         self.bundled_all = set()  # g:a of every library found bundled
         self.exclusions = set()  # g:a excluded on the edges of copies with children (verify)
@@ -855,15 +879,15 @@ class Scan:
 
     def look_inside(self, key, real, jar, name):
         """analyze() of a jar, once per key: copies are byte-identical to the
-        published jar. What its NOTICE lists goes in self.listed, for
+        published jar. What it lists (jar_list()) goes in self.listed, for
         check_relocated: for a jar that bundles no library with metadata, only
         when it has relocated code, which plan() then has checked."""
         if key not in self.analysis:
             pom = self.original_pom(*real.split(":"))
-            listed = notice_libraries(jar) if pom else []
-            self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name, bool(listed))
+            listed = jar_list(jar) if pom else ([], None)
+            self.analysis[key] = (analyze(jar, *real.split(":"), pom, [self.m2, self.overlay], name, any(listed))
                                   if pom else ({}, {}, []))
-            if listed:
+            if any(listed):
                 with zipfile.ZipFile(jar) as z:
                     names = z.namelist()
                 if self.analysis[key][0] or unexplained(jar, names, []):
@@ -876,12 +900,13 @@ class Scan:
         jars explains, such as a second version of one of them, whose
         pom.properties had the same path. Libraries whose class files it is are
         identified: first those the jar's own pom.xml names, at the versions it
-        was built with; then those its NOTICE lists, whose class files are all
-        there (identify_listed()), their jars downloaded in one Maven run; then,
-        for what's left, those the POMs of the libraries found name, in any
-        version Maven considers (a library nested in one of them isn't in the
-        jar's own tree). A jar that bundles no library with metadata has only
-        its NOTICE's. Versions whose class files tie are settled by the jar's
+        was built with; then those it lists (jar_list(): its NOTICE, or the
+        BOM of the version a file of VERSION_FILES names), whose class files
+        are all there (identify_listed()), their jars downloaded in one Maven
+        run; then, for what's left, those the POMs of the libraries found
+        name, in any version Maven considers (a library nested in one of them
+        isn't in the jar's own tree). A jar that bundles no library with
+        metadata has only its own list. Versions whose class files tie are settled by the jar's
         published POM (settle_tie()). The rest is warned about. Once per key."""
         todo = []
         for key, jar, name in items:
@@ -894,7 +919,12 @@ class Scan:
                     names = z.namelist()
                 self.unexplained[key] = unexplained(jar, names, libs)
                 todo.append((key, jar, name, names, libs))
-        self.download(sorted({c for key, *_ in todo if self.unexplained[key] for c in self.listed.get(key, [])}))
+        for key, *_ in todo:
+            source = self.listed.get(key, ([], None))[1]
+            if source and self.unexplained[key]:
+                self.listed[key] = (self.bom_libraries(source[1]), source)
+        self.download(sorted({c for key, *_ in todo if self.unexplained[key]
+                              for c in self.listed.get(key, ([], None))[0]}))
         shared = None  # candidates(), listed once
         for key, jar, name, names, libs in todo:
             found, ties, known, settled, noticed = [], [], list(libs), {}, set()
@@ -904,7 +934,8 @@ class Scan:
                 if source == "own":
                     candidates = self.own_candidates(key, jar, name)
                 elif source == "notice":
-                    candidates = {c: self.find_jar(*c) for c in self.listed.get(key, []) if self.find_jar(*c)}
+                    named = self.listed.get(key, ([], None))[0]
+                    candidates = {c: self.find_jar(*c) for c in named if self.find_jar(*c)}
                 else:
                     shared = self.candidates() if shared is None else shared
                     candidates = shared
@@ -929,7 +960,11 @@ class Scan:
                     log("Shaded in %s: %s:%s (by its class files, which %s match too; the jar's published POM sets %s)"
                         % (name, ga, v, ", ".join(o + "'s" for o in settled[(ga, v)]), v))
                 elif (ga, v) in noticed:
-                    log("Shaded in %s: %s:%s (by its class files; the jar's NOTICE lists it)" % (name, ga, v))
+                    source = self.listed[key][1]
+                    log("Shaded in %s: %s:%s (by its class files; %s)" % (name, ga, v, (
+                        "the jar's %s names version %s, and the BOM %s lists it"
+                        % (source[0], source[1].rsplit(":", 1)[1], source[1])
+                        if source else "the jar's NOTICE lists it")))
                 else:
                     log("Shaded in %s: %s:%s (by its class files: it has no Maven metadata there)" % (name, ga, v))
             for group in ties:
@@ -938,6 +973,20 @@ class Scan:
                         % (name, ", ".join(group)))
             self.identified[key] = found
             warn_unexplained(name, names, self.unexplained[key])
+
+    def bom_libraries(self, bom):
+        """[(g:a, v)] of the jars BOM (g:a:v) manages, but not a classifier's
+        (native code); its POM fetched if missing. [] if Maven can't get it."""
+        g, a, v = bom.split(":")
+        if not self.original_pom(g, a, v):
+            self.fetch([bom + ":pom"])
+        path = self.original_pom(g, a, v)
+        if path is None:
+            return []
+        with open(path, "rb") as f:
+            managed = Pom(f.read(), g, v, [self.m2, self.overlay], path).managed
+        return sorted({(k.rsplit(":", 2)[0], version) for k, (version, _) in managed.items()
+                       if k.endswith(":jar:") and version and "${" not in version})
 
     def published_pom(self, key):
         """The Pom of the published POM of the jar of analysis KEY; None if missing."""
